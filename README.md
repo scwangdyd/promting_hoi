@@ -1,5 +1,8 @@
 # promting_hoi
 
+- [x] Disjoint detector + CLIP
+- [] End-to-end HOI detector + CLIP
+
 ## Baseline 1: Disjoint object detector + CLIP
 In the first stage, we use an object detector to generate the bounding boxes for all objects (including humans). Then we pairwisely combine every human and object boxes to build multiple pairs.
 
@@ -14,7 +17,6 @@ python baseline_disjoint_detector_and_clip.py \
 --precomputed-boxes [path-to-boxes] \
 --dataset-annos [path-to-annotations]
 ```
-
 
 ## Experimental Results
 **HOI Detection on HICO-DET dataset** All experiment settings follow [VCL](https://github.com/zhihou7/HOI-CL).
@@ -35,4 +37,4 @@ python baseline_disjoint_detector_and_clip.py \
 | JSR, ECCV20  |  2.34  | 6.10 |   10.01  |
 | QMD, ICCV21  |  2.64  | 6.63 |   10.93  |
 | Baseline 1 (JSR)  |  2.44  | 4.11 |   7.87   |
-* Baseline 1 (JSR): using the boxes computed by [JSR](https://github.com/allenai/swig).
+* Baseline 1 (JSR): using the boxes computed by [JSR](https://github.com/allenai/swig). Right now, the result is not good may due to the low box quality given by JSR.
