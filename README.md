@@ -1,7 +1,7 @@
 # promting_hoi
 
 - [x] Disjoint detector + CLIP
-- [] End-to-end HOI detector + CLIP
+- [ ] End-to-end HOI detector + CLIP
 
 ## Baseline 1: Disjoint object detector + CLIP
 In the first stage, we use an object detector to generate the bounding boxes for all objects (including humans). Then we pairwisely combine every human and object boxes to build multiple pairs.
