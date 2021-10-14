@@ -169,9 +169,6 @@ def make_transforms(image_set):
 
 
 def build(image_set, args):
-    root = Path(args.coco_path)
-    assert root.exists(), f'provided COCO path {root} does not exist'
-    mode = 'instances'
 
     PATHS = {
         "train": ("/raid1/suchen/dataset/swig/images_512",

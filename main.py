@@ -73,8 +73,6 @@ def get_args_parser():
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='swig')
-    parser.add_argument('--coco_path', default="/raid1/suchen/repo/FsDet/datasets/coco/", type=str)
-
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',

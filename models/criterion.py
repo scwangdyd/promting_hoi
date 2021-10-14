@@ -34,11 +34,19 @@ class SetCriterion(nn.Module):
         assert 'logits_per_hoi' in outputs
         src_logits = outputs['logits_per_hoi']
 
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.arange(sum([len(t["hois"]) for t in targets])).to(src_logits.device)
-        target_classes = torch.full(src_logits.shape[:2], src_logits.shape[-1] - 1,
-                                    dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
+        target_classes_o = []
+        offset = 0
+        for t, (_, indices_per_t) in zip(targets, indices):
+            for i in indices_per_t:
+                target_classes_o.append(i + offset)
+            offset += len(t["hois"])
+        target_classes_o = torch.as_tensor(target_classes_o).to(src_logits.device)
+
+        idx = self._get_src_permutation_idx(indices) 
+        # target_classes_o = torch.arange(sum([len(t["hois"]) for t in targets])).to(src_logits.device)
+        # target_classes = torch.full(src_logits.shape[:2], src_logits.shape[-1] - 1,
+        #                             dtype=torch.int64, device=src_logits.device)
+        # target_classes[idx] = target_classes_o
 
         # loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
         loss_i = F.cross_entropy(src_logits[idx], target_classes_o)

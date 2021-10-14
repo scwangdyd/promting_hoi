@@ -40,7 +40,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         for t in targets:
             for hoi in t["hois"]:
                 texts.append(hoi["text"])
-        # texts.append("This is a useless token")
+        # texts.append("This is a useless predictions and can be ignored")
         text_tokens = torch.cat([clip.tokenize(s) for s in texts]).to(device)
 
         outputs = model(images.tensors, text_tokens)
