@@ -34,28 +34,26 @@ class SetCriterion(nn.Module):
         assert 'logits_per_hoi' in outputs
         src_logits = outputs['logits_per_hoi']
 
-        target_classes_o = []
+        target_classes_i = []
         offset = 0
         for t, (_, indices_per_t) in zip(targets, indices):
             for i in indices_per_t:
-                target_classes_o.append(i + offset)
+                target_classes_i.append(i + offset)
             offset += len(t["hois"])
-        target_classes_o = torch.as_tensor(target_classes_o).to(src_logits.device)
+        target_classes_i = torch.as_tensor(target_classes_i).to(src_logits.device)
 
-        idx = self._get_src_permutation_idx(indices) 
-        # target_classes_o = torch.arange(sum([len(t["hois"]) for t in targets])).to(src_logits.device)
-        # target_classes = torch.full(src_logits.shape[:2], src_logits.shape[-1] - 1,
-        #                             dtype=torch.int64, device=src_logits.device)
-        # target_classes[idx] = target_classes_o
-
-        # loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
-        loss_i = F.cross_entropy(src_logits[idx], target_classes_o)
-        loss_t = F.cross_entropy(src_logits[idx].t(), target_classes_o)
+        idx = self._get_src_permutation_idx(indices)
+        loss_i = F.cross_entropy(src_logits[idx], target_classes_i)
+        
+        mapper = {int(t): i for i, t in enumerate(target_classes_i)}
+        target_classes_t = [mapper[t] for t in range(len(target_classes_i))]
+        target_classes_t = torch.as_tensor(target_classes_t).to(src_logits.device)
+        loss_t = F.cross_entropy(src_logits[idx].t(), target_classes_t)
         losses = {'loss_ce': (loss_i + loss_t) / 2}
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
-            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_i)[0]
         return losses
 
     @torch.no_grad()
