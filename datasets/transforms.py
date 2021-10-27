@@ -156,6 +156,69 @@ def pad(image, target, padding):
     return padded_image, target
 
 
+def resize_long_edge(image, target, size, max_size=None):
+    """Resize the image based on the long edge."""
+    # size can be min_size (scalar) or (w, h) tuple
+
+    def get_size_with_aspect_ratio(image_size, size, max_size=None):
+        w, h = image_size
+
+        if (w >= h and w == size) or (h >= w and h == size):
+            return (h, w)
+
+        if w > h:
+            ow = size
+            oh = int(size * h / w)
+        else:
+            oh = size
+            ow = int(size * w / h)
+
+        return (oh, ow)
+
+    def get_size(image_size, size, max_size=None):
+        if isinstance(size, (list, tuple)):
+            return size[::-1]
+        else:
+            return get_size_with_aspect_ratio(image_size, size, max_size)
+
+    size = get_size(image.size, size, max_size)
+    rescaled_image = F.resize(image, size)
+
+    if target is None:
+        return rescaled_image, None
+
+    ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_image.size, image.size))
+    ratio_width, ratio_height = ratios
+
+    target = target.copy()
+    if "boxes" in target:
+        boxes = target["boxes"]
+        scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
+        target["boxes"] = scaled_boxes
+
+    if "area" in target:
+        area = target["area"]
+        scaled_area = area * (ratio_width * ratio_height)
+        target["area"] = scaled_area
+
+    h, w = size
+    target["size"] = torch.tensor([h, w])
+
+    if "masks" in target:
+        target['masks'] = interpolate(
+            target['masks'][:, None].float(), size, mode="nearest")[:, 0] > 0.5
+
+    return rescaled_image, target
+
+
+class ColorJitter(object):
+    def __init__(self, brightness, contrast, saturation):
+        self.color_jitter = T.ColorJitter(brightness, contrast, saturation)
+
+    def __call__(self, img, target):
+        return self.color_jitter(img), target
+
+
 class RandomCrop(object):
     def __init__(self, size):
         self.size = size
@@ -188,6 +251,17 @@ class CenterCrop(object):
         crop_left = int(round((image_width - crop_width) / 2.))
         return crop(img, target, (crop_top, crop_left, crop_height, crop_width))
 
+class ResizeAndCenterCrop(object):
+    def __init__(self, size):
+        self.size = size
+        
+    def __call__(self, img, target):
+        img, target = resize_long_edge(img, target, self.size)
+        image_width, image_height = img.size
+        crop_height, crop_width = self.size, self.size
+        crop_top = int(round((image_height - crop_height) / 2.))
+        crop_left = int(round((image_width - crop_width) / 2.))
+        return crop(img, target, (crop_top, crop_left, crop_height, crop_width))
 
 class RandomHorizontalFlip(object):
     def __init__(self, p=0.5):

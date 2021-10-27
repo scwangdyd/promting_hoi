@@ -4,22 +4,20 @@ SWiG-HOI dataset which returns image_id for evaluation.
 """
 import os
 import json
-from pathlib import Path
 import torch
 import torch.utils.data
 from torchvision.datasets import CocoDetection
 import datasets.transforms as T
 from PIL import Image
 from .swig_v1_categories import SWIG_INTERACTIONS, SWIG_ACTIONS, SWIG_CATEGORIES
-from torchvision.transforms import InterpolationMode, ColorJitter
-BICUBIC = InterpolationMode.BICUBIC
+from utils.sampler import repeat_factors_from_category_frequency, get_dataset_indices
 
 HOI_MAPPER = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
 
 class SWiGHOIDetection(CocoDetection):
-    def __init__(self, img_folder, ann_file, transforms):
+    def __init__(self, img_folder, ann_file, transforms, repeat_factor_sampling=False):
         self.root = img_folder
-        self.dataset_dicts = load_swig_json(ann_file, img_folder)
+        self.dataset_dicts = load_swig_json(ann_file, img_folder, repeat_factor_sampling)
         self.transforms = transforms
 
     def __getitem__(self, idx: int):
@@ -53,7 +51,7 @@ class SWiGHOIDetection(CocoDetection):
         return len(self.dataset_dicts)
     
 
-def load_swig_json(json_file, image_root):
+def load_swig_json(json_file, image_root, repeat_factor_sampling=False):
     """
     Load a json file with HOI's instances annotation.
 
@@ -110,6 +108,10 @@ def load_swig_json(json_file, image_root):
         record["annotations"] = targets
         dataset_dicts.append(record)
 
+    if repeat_factor_sampling:
+        repeat_factors = repeat_factors_from_category_frequency(dataset_dicts, repeat_thresh=0.0005)
+        dataset_indices = get_dataset_indices(repeat_factors)
+        dataset_dicts = [dataset_dicts[i] for i in dataset_indices]
     return dataset_dicts
 
 
@@ -138,31 +140,23 @@ def make_transforms(image_set):
         T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
     ])
 
-    if image_set == 'train':
+    if image_set == "train":
         return T.Compose([
             T.RandomHorizontalFlip(),
-            #ColorJitter(brightness=[0.8, 1.2], contrast=[0.8, 1.2], saturation=[0.8, 1.2]), 
-            # T.RandomResize([224]),
-            # T.CenterCrop([224, 224]),
+            T.ColorJitter(brightness=[0.8, 1.2], contrast=[0.8, 1.2], saturation=[0.8, 1.2]),
             T.RandomSelect(
-                T.Compose([
-                    T.RandomResize([224]),
-                    T.CenterCrop([224, 224]),
-                ]),
+                T.ResizeAndCenterCrop(224),
                 T.Compose([
                     T.RandomCrop_InteractionConstraint((0.8, 0.8), 0.9),
-                    T.RandomResize([224]),
-                    T.CenterCrop([224, 224]),
-                ])
+                    T.ResizeAndCenterCrop(224)
+                ]),
             ),
-            normalize,
+            normalize
         ])
-
-    if image_set == 'val':
+    if image_set == "val":
         return T.Compose([
-            T.RandomResize([224]),
-            T.CenterCrop([224, 224]),
-            normalize,
+            T.ResizeAndCenterCrop(224),
+            normalize
         ])
 
     raise ValueError(f'unknown {image_set}')
@@ -174,11 +168,16 @@ def build(image_set, args):
         "train": ("/raid1/suchen/dataset/swig/images_512",
                   "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_trainval_1000.json"),
         "val": ("/raid1/suchen/dataset/swig/images_512",
-                "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_test_1000.json"),
+                "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"),
         "dev": ("/raid1/suchen/dataset/swig/images_512",
                 "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"),
     }
 
     img_folder, ann_file = PATHS[image_set]
-    dataset = SWiGHOIDetection(img_folder, ann_file, transforms=make_transforms(image_set))
+    dataset = SWiGHOIDetection(
+        img_folder,
+        ann_file,
+        transforms=make_transforms(image_set),
+        repeat_factor_sampling=image_set=="train"
+    )
     return dataset
