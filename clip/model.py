@@ -215,9 +215,10 @@ class Transformer(nn.Module):
 
 
 class HOIResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+    def __init__(self, d_model: int, n_head: int):
         super().__init__()
 
+        self.hoi_attn = nn.MultiheadAttention(d_model, n_head)
         self.attn = nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
@@ -226,80 +227,58 @@ class HOIResidualAttentionBlock(nn.Module):
             ("c_proj", nn.Linear(d_model * 4, d_model))
         ]))
         self.ln_2 = LayerNorm(d_model)
-        self.attn_mask = attn_mask
+        
+        self.hoi_ln1 = LayerNorm(d_model)
+        self.hoi_ln2 = LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(0.1)
+        self.dropout2 = nn.Dropout(0.1)
+        self.dropout3 = nn.Dropout(0.1)
 
     def attention(self, x: torch.Tensor, attn_mask: torch.Tensor = None):
-        # self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None):
-        x = x + self.attention(self.ln_1(x), attn_mask)
+    def hoi_attention(self, y: torch.Tensor, attn_mask: torch.Tensor = None):
+        return self.hoi_attn(y, y, y, need_weights=False, attn_mask=attn_mask)[0]
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
+        # Cross self-attn
+        y = y + self.dropout1(self.hoi_attention(self.hoi_ln1(y)))
+        y = y + self.dropout2(self.attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), need_weights=False)[0])
+        y = y + self.dropout3(self.mlp(self.ln_2(y)))
+
+        x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
+
+        return x, y
+
+    # def forward(self, x: torch.Tensor, y: torch.Tensor):
+    #     # Cross self-attn
+    #     y2 = self.hoi_ln1(y)
+    #     y = y + self.dropout1(self.hoi_attn(y2, y2, y2, need_weights=False)[0])
+
+    #     y = y + self.dropout2(self.attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), need_weights=False)[0])
+    #     y = y + self.dropout3(self.mlp(self.ln_2(y)))
+
+    #     x = x + self.attention(self.ln_1(x))
+    #     x = x + self.mlp(self.ln_2(x))
+
+    #     return x, y
 
 
 class HOITransformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
+    def __init__(self, width: int, layers: int, heads: int):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[HOIResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = nn.Sequential(*[HOIResidualAttentionBlock(width, heads) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None):
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
         for resblock in self.resblocks:
-            x = resblock(x, attn_mask)
-        return x
+            x, y = resblock(x, y)
+        return x, y
 
-# class VisionTransformer(nn.Module):
-#     def __init__(
-#         self,
-#         input_resolution: int,
-#         patch_size: int,
-#         width: int,
-#         layers: int,
-#         heads: int,
-#         output_dim: int,
-#         # hoi_token_length: int = 5,
-#     ):
-#         super().__init__()
-#         self.input_resolution = input_resolution
-#         # self.hoi_token_length = hoi_token_length
-#         self.output_dim = output_dim
-#         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
-#         scale = width ** -0.5
-#         self.class_embedding = nn.Parameter(scale * torch.randn(width))
-#         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-#         self.ln_pre = LayerNorm(width)
-
-#         self.transformer = HOITransformer(width, layers, heads)
-
-#         self.ln_post = LayerNorm(width)
-#         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
-        
-#         # self.hoi_embedding = nn.Parameter(scale * torch.randn(hoi_token_length, width))
-#         # self.hoi_positional_embedding = nn.Parameter(scale * torch.randn(hoi_token_length, width))
-
-#     def forward(self, x: torch.Tensor):
-#         x = self.conv1(x)  # shape = [*, width, grid, grid]
-#         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-#         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-#         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-#         x = x + self.positional_embedding.to(x.dtype)
-#         x = self.ln_pre(x)
-
-#         x = x.permute(1, 0, 2)  # NLD -> LND
-#         x = self.transformer(x)
-#         x = x.permute(1, 0, 2)  # LND -> NLD
-
-#         x = self.ln_post(x[:, 0, :])
-
-#         if self.proj is not None:
-#             x = x @ self.proj
-
-#         return x
-
-class VisionTransformer(nn.Module):
+class HOIVisionTransformer(nn.Module):
     def __init__(
         self,
         input_resolution: int,
@@ -328,40 +307,90 @@ class VisionTransformer(nn.Module):
         
         self.hoi_embedding = nn.Parameter(scale * torch.randn(hoi_token_length, width))
         self.hoi_positional_embedding = nn.Parameter(scale * torch.randn(hoi_token_length, width))
+
+        self.hoi_bbox = nn.Linear(width, output_dim)
+        self.hoi_conf = nn.Linear(width, output_dim)
+
+        self.initialize_parameters()
         # self.hoi_proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        # self.hoi_conf_proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def initialize_parameters(self):
+        nn.init.normal_(self.hoi_bbox.weight, std=0.01)
+        nn.init.normal_(self.hoi_conf.weight, std=0.01)
+        self.hoi_bbox.bias.data.fill_(0.01)
+        self.hoi_conf.bias.data.fill_(0.01)
 
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
 
-        # Concatenate [CLS] and [HOI]_1, [HOI]_2, ..., [HOI]_n
-        x = torch.cat([
-            self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-            x,
-            self.hoi_embedding.to(x.dtype) + torch.zeros(x.shape[0], self.hoi_token_length, x.shape[-1], dtype=x.dtype, device=x.device)
-        ], dim=1)  # shape = [*, grid ** 2 + 1 + #hoi_tokens, width]
-        positional_embedding = torch.cat([self.positional_embedding.to(x.dtype), self.hoi_positional_embedding.to(x.dtype)], dim=0)
-        x = x + positional_embedding
+        # Concatenate [CLS]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        # [HOI]_1, [HOI]_2, ..., [HOI]_n
+        y = self.hoi_embedding.to(x.dtype) + torch.zeros(x.shape[0], self.hoi_token_length, x.shape[-1], dtype=x.dtype, device=x.device)
+        
+        x = x + self.positional_embedding.to(x.dtype)
+        y = y + self.hoi_positional_embedding.to(x.dtype)
 
         x = self.ln_pre(x)
-
-        # Create attention maps to avoid the cross-attention computations between
-        # [CLS], [x]_i and newly added [HOI]_i tokens.
-        attn_mask = torch.zeros(x.shape[1], x.shape[1], dtype=torch.bool, device=x.device)
-        attn_mask[0:-self.hoi_token_length, -self.hoi_token_length:] = True
+        y = self.ln_pre(y)
         
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x, attn_mask)
+        y = y.permute(1, 0, 2)  # NLD -> LND
+        x, y = self.transformer(x, y)
         x = x.permute(1, 0, 2)  # LND -> NLD
+        y = y.permute(1, 0, 2)  # LND -> NLD
 
         x_cls = self.ln_post(x[:, 0, :])
-        x_hoi = self.ln_post(x[:, -self.hoi_token_length:, :])
+        y = self.ln_post(y)
         if self.proj is not None:
             x_cls = x_cls @ self.proj
-            x_hoi_cls = x_hoi @ self.proj
+            y_cls = y @ self.proj
+            #y_box = y @ self.hoi_proj
+            #y_conf = y @ self.hoi_conf_proj
 
-        return x_cls, x_hoi_cls, x_hoi
+        y_bbox = self.hoi_bbox(y)
+        y_conf = self.hoi_conf(y)
+
+        return x_cls, y_cls, y_bbox, y_conf
+
+class VisionTransformer(nn.Module):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.output_dim = output_dim
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads)
+
+        self.ln_post = LayerNorm(width)
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+
+    def forward(self, x: torch.Tensor):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        x = self.ln_post(x[:, 0, :])
+
+        if self.proj is not None:
+            x = x @ self.proj
+
+        return x
 
 
 class CLIP(nn.Module):
@@ -511,11 +540,19 @@ def convert_weights(model: nn.Module):
                 if tensor is not None:
                     tensor.data = tensor.data.half()
 
-        for name in ["text_projection", "proj"]:
+        for name in ["text_projection", "proj", "hoi_proj", "hoi_conf_proj"]:
             if hasattr(l, name):
                 attr = getattr(l, name)
                 if attr is not None:
                     attr.data = attr.data.half()
+
+        for name in ["bbox_embed"]:
+            if hasattr(l, name):
+                attr = getattr(l, name)
+                if attr is not None:
+                    for x in attr.layers:
+                        x.weight = x.weight.half()
+                        x.bias = x.bias.half()
 
     model.apply(_convert_weights_to_fp16)
 

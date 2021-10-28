@@ -66,7 +66,10 @@ class HungarianMatcher(nn.Module):
                 person_id = hoi["subject_id"]
                 object_id = hoi["object_id"]
                 tgt_bbox.append(torch.cat([t["boxes"][person_id], t["boxes"][object_id]]))
-                tgt_ids.append(len(tgt_ids))
+                if self.training:
+                    tgt_ids.append(len(tgt_ids))
+                else:
+                    tgt_ids.append(hoi["hoi_id"])
 
         tgt_ids = torch.as_tensor(tgt_ids, dtype=torch.int64, device=out_prob.device)
         tgt_bbox = torch.stack(tgt_bbox, dim=0)

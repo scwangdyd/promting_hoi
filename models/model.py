@@ -6,7 +6,7 @@ from torch import nn
 from typing import Tuple, Union
 
 import utils.box_ops as box_ops
-from clip.model import Transformer, VisionTransformer, LayerNorm, MLP, convert_weights
+from clip.model import Transformer, HOIVisionTransformer, LayerNorm, MLP
 from clip.clip import _download
 from .matcher import build_matcher
 from .criterion import SetCriterion
@@ -45,7 +45,7 @@ class CLIP_HOI_PROMPTER(nn.Module):
         
         # Vision
         vision_heads = vision_width // 64
-        self.visual = VisionTransformer(
+        self.visual = HOIVisionTransformer(
             input_resolution=image_resolution,
             patch_size=vision_patch_size,
             width=vision_width,
@@ -54,7 +54,8 @@ class CLIP_HOI_PROMPTER(nn.Module):
             output_dim=embed_dim,
             hoi_token_length=hoi_token_length,
         )
-        self.bbox_embed = MLP(vision_width, vision_width, 8, 3)
+        self.bbox_embed = MLP(embed_dim, embed_dim, 8, 3)
+        self.hoi_confidence = nn.Linear(embed_dim, 2)
 
         # Text
         self.transformer = Transformer(
@@ -70,6 +71,11 @@ class CLIP_HOI_PROMPTER(nn.Module):
 
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        # prefix_length = 8
+        # conjun_length = 4
+        # self.hoi_prefix = nn.Parameter(torch.empty(prefix_length, transformer_width))
+        # self.hoi_conjun = nn.Parameter(torch.empty(conjun_length, transformer_width))
 
         self.initialize_parameters()
 
@@ -90,8 +96,11 @@ class CLIP_HOI_PROMPTER(nn.Module):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
         for layer in self.bbox_embed.layers:
-            torch.nn.init.normal_(layer.weight, std=proj_std)
+            nn.init.normal_(layer.weight, std=0.01)
             layer.bias.data.fill_(0.01)
+            
+        nn.init.normal_(self.hoi_confidence.weight, std=0.01)
+        self.hoi_confidence.bias.data.fill_(0.01)
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -124,7 +133,7 @@ class CLIP_HOI_PROMPTER(nn.Module):
         return x
 
     def forward(self, image, text):
-        image_features, hoi_features, box_features = self.encode_image(image)
+        image_features, hoi_features, bbox_features, conf_feature = self.encode_image(image)
         text_features = self.encode_text(text)
 
         # normalized features
@@ -137,7 +146,8 @@ class CLIP_HOI_PROMPTER(nn.Module):
         logits_per_text = logits_per_image.t()
 
         # person and object box regression
-        boxes = self.bbox_embed(box_features).sigmoid()
+        boxes = self.bbox_embed(bbox_features).sigmoid()
+        confidence_scores = self.hoi_confidence(F.relu(conf_feature))
 
         # cosine similarity between hoi_features and text_features
         hoi_features = hoi_features / hoi_features.norm(dim=-1, keepdim=True)
@@ -148,6 +158,7 @@ class CLIP_HOI_PROMPTER(nn.Module):
             "logits_per_text": logits_per_text,
             "pred_boxes": boxes,
             "logits_per_hoi": logits_per_hoi,
+            "confidence_scores": confidence_scores,
         }
 
 
@@ -212,12 +223,16 @@ def build_model(args):
         model_path = _download(_MODELS[args.clip_model], os.path.expanduser("~/.cache/clip"))
         clip_model = torch.jit.load(model_path).eval()
         model.load_state_dict(clip_model.state_dict(), strict=False)
+    
+    if args.pretrained:
+        checkpoint = torch.load(args.pretrained, map_location='cpu')
+        model.load_state_dict(checkpoint["model"], strict=False)
 
     matcher = build_matcher(args)
-    weight_dict = {'loss_ce': 1, 'loss_bbox': args.bbox_loss_coef}
+    weight_dict = {'loss_ce': 1., 'loss_bbox': args.bbox_loss_coef, 'loss_confi': 1.}
     weight_dict['loss_giou'] = args.giou_loss_coef
 
-    losses = ['labels', 'boxes']
+    losses = ['labels', 'boxes', "confidences"]
     criterion = SetCriterion(
         num_classes,
         matcher=matcher,
@@ -227,6 +242,6 @@ def build_model(args):
     )
     criterion.to(device)
 
-    postprocessors = {'bbox': PostProcess()}
+    postprocessors = PostProcess()
 
     return model, criterion, postprocessors
