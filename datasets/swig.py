@@ -15,10 +15,17 @@ from utils.sampler import repeat_factors_from_category_frequency, get_dataset_in
 HOI_MAPPER = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
 
 class SWiGHOIDetection(CocoDetection):
-    def __init__(self, img_folder, ann_file, transforms, repeat_factor_sampling=False):
+    def __init__(self, img_folder, ann_file, transforms, image_set):
         self.root = img_folder
-        self.dataset_dicts = load_swig_json(ann_file, img_folder, repeat_factor_sampling)
         self.transforms = transforms
+        # Text description of human-object interactions
+        dataset_texts, text_mapper = prepare_dataset_text(image_set)
+        self.dataset_texts = dataset_texts
+        self.text_mapper = text_mapper
+        # Load dataset
+        repeat_factor_sampling = True if image_set == "train" else False
+        reverse_text_mapper = {v: k for k, v in text_mapper.items()}
+        self.dataset_dicts = load_swig_json(ann_file, img_folder, reverse_text_mapper, repeat_factor_sampling)
 
     def __getitem__(self, idx: int):
         
@@ -26,6 +33,10 @@ class SWiGHOIDetection(CocoDetection):
         image = Image.open(filename).convert("RGB")
         
         w, h = image.size
+        assert w == self.dataset_dicts[idx]["width"], "image shape is not consistent."
+        assert h == self.dataset_dicts[idx]["height"], "image shape is not consistent."
+
+        image_id = self.dataset_dicts[idx]["image_id"]
         annos = self.dataset_dicts[idx]["annotations"]
         
         boxes = torch.as_tensor(annos["boxes"], dtype=torch.float32).reshape(-1, 4)
@@ -36,6 +47,8 @@ class SWiGHOIDetection(CocoDetection):
         aux_classes = torch.tensor(annos["aux_classes"], dtype=torch.int64)
 
         target = {
+            "image_id": torch.tensor(image_id),
+            "orig_size": torch.tensor([h, w]),
             "boxes": boxes,
             "classes": classes,
             "aux_classes": aux_classes,
@@ -51,7 +64,7 @@ class SWiGHOIDetection(CocoDetection):
         return len(self.dataset_dicts)
     
 
-def load_swig_json(json_file, image_root, repeat_factor_sampling=False):
+def load_swig_json(json_file, image_root, text_mapper, repeat_factor_sampling=False):
     """
     Load a json file with HOI's instances annotation.
 
@@ -95,8 +108,9 @@ def load_swig_json(json_file, image_root, repeat_factor_sampling=False):
             target_id = hoi["object_id"]
             object_id = classes[target_id]
             action_id = hoi["action_id"]
-            hoi["hoi_id"] = HOI_MAPPER[(action_id, object_id)]
             hoi["text"] = generate_text(action_id, object_id)
+            continguous_id = HOI_MAPPER[(action_id, object_id)]
+            hoi["hoi_id"] = text_mapper[continguous_id]
 
         targets = {
             "boxes": boxes,
@@ -109,7 +123,7 @@ def load_swig_json(json_file, image_root, repeat_factor_sampling=False):
         dataset_dicts.append(record)
 
     if repeat_factor_sampling:
-        repeat_factors = repeat_factors_from_category_frequency(dataset_dicts, repeat_thresh=0.0005)
+        repeat_factors = repeat_factors_from_category_frequency(dataset_dicts, repeat_thresh=0.0001)
         dataset_indices = get_dataset_indices(repeat_factors)
         dataset_dicts = [dataset_dicts[i] for i in dataset_indices]
     return dataset_dicts
@@ -126,11 +140,39 @@ def generate_text(action_id, object_id):
         obj_gloss = " or ".join(obj_gloss)
     else:
         obj_gloss = obj_gloss[0]
-    # s = f"A photo of a person {act} with object {obj}. The object {obj} means {obj_def}."
-    # s = f"a photo of a person {act} with object {obj}"
-    # s = f"A photo of a person {act} with {obj}. The {act} means to {act_def}."
-    s = f"A photo of a person {act} with {obj_gloss}. The {act} means to {act_def}."
+
+    s = [act, obj_gloss]
     return s
+
+# def generate_text(action_id, object_id):
+#     act = SWIG_ACTIONS[action_id]["name"]
+#     obj = SWIG_CATEGORIES[object_id]["name"]
+#     act_def = SWIG_ACTIONS[action_id]["def"]
+#     obj_def = SWIG_CATEGORIES[object_id]["def"]
+#     obj_gloss = SWIG_CATEGORIES[object_id]["gloss"]
+#     obj_gloss = [obj] + [x for x in obj_gloss if x != obj]
+#     if len(obj_gloss) > 1:
+#         obj_gloss = " or ".join(obj_gloss)
+#     else:
+#         obj_gloss = obj_gloss[0]
+#     # s = f"A photo of a person {act} with object {obj}. The object {obj} means {obj_def}."
+#     # s = f"a photo of a person {act} with object {obj}"
+#     # s = f"A photo of a person {act} with {obj}. The {act} means to {act_def}."
+#     s = f"A photo of a person {act} with {obj_gloss}. The {act} means to {act_def}."
+#     return s
+
+
+def prepare_dataset_text(image_set):
+    texts = []
+    text_mapper = {}
+    for i, hoi in enumerate(SWIG_INTERACTIONS):
+        if image_set != "train" and hoi["evaluation"] == 0: continue
+        action_id = hoi["action_id"]
+        object_id = hoi["object_id"]
+        s = generate_text(action_id, object_id)
+        text_mapper[len(texts)] = i
+        texts.append(s)
+    return texts, text_mapper
 
 
 def make_transforms(image_set):
@@ -178,6 +220,6 @@ def build(image_set, args):
         img_folder,
         ann_file,
         transforms=make_transforms(image_set),
-        repeat_factor_sampling=image_set=="train"
+        image_set=image_set
     )
     return dataset

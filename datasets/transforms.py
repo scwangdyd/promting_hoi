@@ -14,6 +14,7 @@ from .augmentation import Augmentation
 
 
 def crop(image, target, region):
+    ori_w, ori_h = image.size
     cropped_image = F.crop(image, *region)
 
     target = target.copy()
@@ -21,6 +22,15 @@ def crop(image, target, region):
 
     # should we do something wrt the original size?
     target["size"] = torch.tensor([h, w])
+
+    # Image is padded with 0 if the crop region is out of boundary.
+    # We use `image_mask` to indicate the padding regions.
+    image_mask = torch.zeros((h, w)).bool()
+    image_mask[:abs(i), :] = True
+    image_mask[:, :abs(j)] = True
+    image_mask[abs(i) + ori_h :, :]  = True
+    image_mask[:, abs(j) + ori_w :]  = True
+    target["image_mask"] = image_mask
 
     fields = ["classes"]
 
