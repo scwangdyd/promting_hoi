@@ -38,6 +38,8 @@ class CLIP_HOI_PROMPTER(nn.Module):
         transformer_width: int,
         transformer_heads: int,
         transformer_layers: int,
+        prefix_length: int = 8,
+        conjun_length: int = 2,
     ):
         super().__init__()
         
@@ -55,7 +57,7 @@ class CLIP_HOI_PROMPTER(nn.Module):
             hoi_token_length=hoi_token_length,
         )
         self.bbox_embed = MLP(embed_dim, embed_dim, 8, 3)
-        self.hoi_confidence = nn.Linear(embed_dim, 2)
+        self.hoi_confidence_embed = nn.Linear(embed_dim, 1)
 
         # Text
         self.transformer = Transformer(
@@ -72,10 +74,10 @@ class CLIP_HOI_PROMPTER(nn.Module):
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        # prefix_length = 8
-        # conjun_length = 4
-        # self.hoi_prefix = nn.Parameter(torch.empty(prefix_length, transformer_width))
-        # self.hoi_conjun = nn.Parameter(torch.empty(conjun_length, transformer_width))
+        self.prefix_length = prefix_length
+        self.conjun_length = conjun_length
+        self.hoi_prefix = nn.Parameter(torch.empty(prefix_length, transformer_width))
+        self.hoi_conjun = nn.Parameter(torch.empty(conjun_length, transformer_width))
 
         self.initialize_parameters()
 
@@ -98,9 +100,12 @@ class CLIP_HOI_PROMPTER(nn.Module):
         for layer in self.bbox_embed.layers:
             nn.init.normal_(layer.weight, std=0.01)
             layer.bias.data.fill_(0.01)
-            
-        nn.init.normal_(self.hoi_confidence.weight, std=0.01)
-        self.hoi_confidence.bias.data.fill_(0.01)
+        
+        nn.init.normal_(self.hoi_confidence_embed.weight, std=0.01)
+        self.hoi_confidence_embed.bias.data.fill_(0.01)
+        
+        nn.init.normal_(self.hoi_prefix, std=0.01)
+        nn.init.normal_(self.hoi_conjun, std=0.01)
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -114,12 +119,12 @@ class CLIP_HOI_PROMPTER(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, image_mask=None):
+        return self.visual(image.type(self.dtype), image_mask)
 
     def encode_text(self, text):
-        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
-
+        # x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+        x, eot_indices = self.text_to_embedding(text)
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
@@ -128,12 +133,41 @@ class CLIP_HOI_PROMPTER(nn.Module):
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        # x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        x = x[torch.arange(x.shape[0]), eot_indices] @ self.text_projection
 
         return x
 
-    def forward(self, image, text):
-        image_features, hoi_features, bbox_features, conf_feature = self.encode_image(image)
+    def text_to_embedding(self, text):
+        """ text (List[List[Tensor]]): A list of action text tokens and object text tokens.
+            [
+                [action text 1, object text 1],
+                [action text 2, object text 2],
+                ...
+                [action text n, object text n],
+            ]
+        """
+        all_token_embeddings = []
+        eot_indices = []
+        for action_token, object_token in text:
+            remain_length = self.context_length - self.prefix_length - self.conjun_length - len(action_token) - len(object_token)
+            if remain_length < 0:
+                raise RuntimeError(f"Input text is too long for context length {self.context_length}")
+            eot_indices.append(self.context_length - remain_length - 1)
+            padding_zeros = torch.zeros(remain_length, dtype=torch.long).to(action_token.device)
+            token = torch.cat([action_token, object_token, padding_zeros])
+            token_embedding = self.token_embedding(token).type(self.dtype)
+            full_token_embedding = torch.cat([
+                token_embedding[0:1, :], self.hoi_prefix, token_embedding[1:len(action_token), :],
+                self.hoi_conjun, token_embedding[len(action_token):, :]], dim=0)
+            all_token_embeddings.append(full_token_embedding)
+
+        eot_indices = torch.as_tensor(eot_indices)
+        x = torch.stack(all_token_embeddings, dim=0)  # [batch_size, n_ctx, d_model]
+        return x, eot_indices
+
+    def forward(self, image, text, image_mask=None):
+        image_features, hoi_features, bbox_features, conf_features, attn_maps = self.encode_image(image, image_mask)
         text_features = self.encode_text(text)
 
         # normalized features
@@ -147,7 +181,7 @@ class CLIP_HOI_PROMPTER(nn.Module):
 
         # person and object box regression
         boxes = self.bbox_embed(bbox_features).sigmoid()
-        confidence_scores = self.hoi_confidence(F.relu(conf_feature))
+        confidence_scores = self.hoi_confidence_embed(F.relu(conf_features))
 
         # cosine similarity between hoi_features and text_features
         hoi_features = hoi_features / hoi_features.norm(dim=-1, keepdim=True)
@@ -159,6 +193,7 @@ class CLIP_HOI_PROMPTER(nn.Module):
             "pred_boxes": boxes,
             "logits_per_hoi": logits_per_hoi,
             "confidence_scores": confidence_scores,
+            "attention_maps": attn_maps,
         }
 
 
@@ -215,6 +250,8 @@ def build_model(args):
         args.transformer_width,
         args.transformer_heads,
         args.transformer_layers,
+        args.prefix_length,
+        args.conjun_length,
     )
 
     # convert_weights(model)

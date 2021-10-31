@@ -11,15 +11,14 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import utils.misc as utils
 from datasets import build_dataset
-from engine import train_one_epoch # evaluate
+from engine import train_one_epoch, evaluate
 from models import build_model
-
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=4, type=int)
+    parser.add_argument('--batch_size', default=8, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--lr_drop', default=200, type=int)
@@ -46,7 +45,7 @@ def get_args_parser():
                         help="Number of learnable hoi tokens added to transformer's input")
     # * Text
     parser.add_argument('--context_length', default=77, type=int,
-                        help="")
+                        help="Maximum length of the text description")
     parser.add_argument('--vocab_size', default=49408, type=int,
                         help="")
     parser.add_argument('--transformer_width', default=512, type=int,
@@ -55,6 +54,10 @@ def get_args_parser():
                         help="")
     parser.add_argument('--transformer_layers', default=12, type=int,
                         help="")
+    parser.add_argument('--prefix_length', default=8, type=int,
+                        help="Length the of the learnable prefix in the sentence")
+    parser.add_argument('--conjun_length', default=2, type=int,
+                        help="Length of the conjunction words between actions and objects")
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                         help="Disables auxiliary decoding losses (loss at each layer)")
@@ -79,6 +82,7 @@ def get_args_parser():
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=36, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--pretrained', default='', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
@@ -164,19 +168,22 @@ def main(args):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
+            print(f"load checkpoint from {args.resume}")
             checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
+            # checkpoint['optimizer']["param_groups"][0]["lr"] = 0.0001
             optimizer.load_state_dict(checkpoint['optimizer'])
+            # checkpoint["lr_scheduler"]["step_size"] = args.lr_drop
+            # checkpoint["lr_scheduler"]["_last_lr"] = [0.0001, 0.0]
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
 
-    # if args.eval:
-    #     test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-    #                                           data_loader_val, base_ds, device, args.output_dir)
-    #     if args.output_dir:
-    #         utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
-    #     return
+    if args.eval:
+        test_stats, evaluator = evaluate(model, criterion, data_loader_val, device, args)
+        # if args.output_dir:
+        #     utils.save_on_master(evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+        return
 
     print("Start training")
     start_time = time.time()

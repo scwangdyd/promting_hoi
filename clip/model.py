@@ -234,35 +234,23 @@ class HOIResidualAttentionBlock(nn.Module):
         self.dropout2 = nn.Dropout(0.1)
         self.dropout3 = nn.Dropout(0.1)
 
-    def attention(self, x: torch.Tensor, attn_mask: torch.Tensor = None):
-        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
+    def attention(self, x: torch.Tensor, mask: torch.Tensor = None):
+        return self.attn(x, x, x, need_weights=False, key_padding_mask=mask)[0]
 
     def hoi_attention(self, y: torch.Tensor, attn_mask: torch.Tensor = None):
         return self.hoi_attn(y, y, y, need_weights=False, attn_mask=attn_mask)[0]
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None):
         # Cross self-attn
         y = y + self.dropout1(self.hoi_attention(self.hoi_ln1(y)))
-        y = y + self.dropout2(self.attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), need_weights=False)[0])
+        y2, attn_map = self.attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), key_padding_mask=mask)
+        y = y + self.dropout2(y2)
         y = y + self.dropout3(self.mlp(self.ln_2(y)))
 
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
 
-        return x, y
-
-    # def forward(self, x: torch.Tensor, y: torch.Tensor):
-    #     # Cross self-attn
-    #     y2 = self.hoi_ln1(y)
-    #     y = y + self.dropout1(self.hoi_attn(y2, y2, y2, need_weights=False)[0])
-
-    #     y = y + self.dropout2(self.attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), need_weights=False)[0])
-    #     y = y + self.dropout3(self.mlp(self.ln_2(y)))
-
-    #     x = x + self.attention(self.ln_1(x))
-    #     x = x + self.mlp(self.ln_2(x))
-
-    #     return x, y
+        return x, y, attn_map
 
 
 class HOITransformer(nn.Module):
@@ -272,10 +260,10 @@ class HOITransformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.Sequential(*[HOIResidualAttentionBlock(width, heads) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None):
         for resblock in self.resblocks:
-            x, y = resblock(x, y)
-        return x, y
+            x, y, attn_map = resblock(x, y, mask)
+        return x, y, attn_map
 
 
 class HOIVisionTransformer(nn.Module):
@@ -293,6 +281,7 @@ class HOIVisionTransformer(nn.Module):
         self.input_resolution = input_resolution
         self.hoi_token_length = hoi_token_length
         self.output_dim = output_dim
+        self.patch_size = patch_size
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
@@ -312,8 +301,6 @@ class HOIVisionTransformer(nn.Module):
         self.hoi_conf = nn.Linear(width, output_dim)
 
         self.initialize_parameters()
-        # self.hoi_proj = nn.Parameter(scale * torch.randn(width, output_dim))
-        # self.hoi_conf_proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def initialize_parameters(self):
         nn.init.normal_(self.hoi_bbox.weight, std=0.01)
@@ -321,10 +308,16 @@ class HOIVisionTransformer(nn.Module):
         self.hoi_bbox.bias.data.fill_(0.01)
         self.hoi_conf.bias.data.fill_(0.01)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        if mask is not None:
+            mask = F.avg_pool2d(mask.float(), kernel_size=self.patch_size)
+            mask[mask < 1.] = 0.
+            mask = mask.bool()
+            mask = mask.reshape(mask.shape[0], -1) # shape = [*, grid ** 2]
+            mask = torch.cat([torch.ones((mask.shape[0], 1), dtype=mask.dtype, device=mask.device), mask], dim=-1)
 
         # Concatenate [CLS]
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
@@ -339,22 +332,20 @@ class HOIVisionTransformer(nn.Module):
         
         x = x.permute(1, 0, 2)  # NLD -> LND
         y = y.permute(1, 0, 2)  # NLD -> LND
-        x, y = self.transformer(x, y)
+        x, y, attn_map = self.transformer(x, y, mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
         y = y.permute(1, 0, 2)  # LND -> NLD
 
         x_cls = self.ln_post(x[:, 0, :])
         y = self.ln_post(y)
-        if self.proj is not None:
-            x_cls = x_cls @ self.proj
-            y_cls = y @ self.proj
-            #y_box = y @ self.hoi_proj
-            #y_conf = y @ self.hoi_conf_proj
+
+        x_cls = x_cls @ self.proj
+        y_cls = y @ self.proj
 
         y_bbox = self.hoi_bbox(y)
         y_conf = self.hoi_conf(y)
 
-        return x_cls, y_cls, y_bbox, y_conf
+        return x_cls, y_cls, y_bbox, y_conf, attn_map
 
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
@@ -540,7 +531,7 @@ def convert_weights(model: nn.Module):
                 if tensor is not None:
                     tensor.data = tensor.data.half()
 
-        for name in ["text_projection", "proj", "hoi_proj", "hoi_conf_proj"]:
+        for name in ["text_projection", "proj", "hoi_prefix", "hoi_conjun"]:
             if hasattr(l, name):
                 attr = getattr(l, name)
                 if attr is not None:

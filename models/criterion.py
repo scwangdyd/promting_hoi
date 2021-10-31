@@ -35,42 +35,52 @@ class SetCriterion(nn.Module):
         src_logits = outputs['logits_per_hoi']
 
         target_classes_i = []
-        offset = 0
-        for t, (_, indices_per_t) in zip(targets, indices):
-            for i in indices_per_t:
-                target_classes_i.append(i + offset)
-            offset += len(t["hois"])
-        target_classes_i = torch.as_tensor(target_classes_i).to(src_logits.device)
+        if self.training:
+            offset = 0
+            for t, (_, indices_per_t) in zip(targets, indices):
+                for i in indices_per_t:
+                    target_classes_i.append(i + offset)
+                offset += len(t["hois"])
+            target_classes_i = torch.as_tensor(target_classes_i).to(src_logits.device)
+        else:
+            for t, (_, indices_per_t) in zip(targets, indices):
+                for i in indices_per_t:
+                    target_classes_i.append(t["hois"][int(i)]["hoi_id"])
+            target_classes_i = torch.as_tensor(target_classes_i).to(src_logits.device)
 
         idx = self._get_src_permutation_idx(indices)
         loss_i = F.cross_entropy(src_logits[idx], target_classes_i)
-        
-        mapper = {int(t): i for i, t in enumerate(target_classes_i)}
-        target_classes_t = [mapper[t] for t in range(len(target_classes_i))]
-        target_classes_t = torch.as_tensor(target_classes_t).to(src_logits.device)
-        loss_t = F.cross_entropy(src_logits[idx].t(), target_classes_t)
-        losses = {'loss_ce': (loss_i + loss_t) / 2}
+        if self.training:
+            mapper = {int(t): i for i, t in enumerate(target_classes_i)}
+            target_classes_t = [mapper[t] for t in range(len(target_classes_i))]
+            target_classes_t = torch.as_tensor(target_classes_t).to(src_logits.device)
+            loss_t = F.cross_entropy(src_logits[idx].t(), target_classes_t)
+            losses = {'loss_ce': (loss_i + loss_t) / 2}
+        else:
+            losses = {'loss_i': loss_i}
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_i)[0]
         return losses
 
-    @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, num_boxes):
-        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
-        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
+    def loss_confidences(self, outputs, targets, indices, num_boxes, log=True):
+        """Confidence score for the interaction prediction.
         """
-        pred_logits = outputs['pred_logits']
-        device = pred_logits.device
-        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-        # Count the number of predictions that are NOT "no-object" (which is the last class)
-        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
-        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
-        losses = {'cardinality_error': card_err}
+        assert 'confidence_scores' in outputs
+        confidence_scores = outputs['confidence_scores']
+
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([torch.ones(len(J), dtype=torch.int64, device=confidence_scores.device) for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(confidence_scores.shape[:2], 0, dtype=torch.int64, device=confidence_scores.device)
+        target_classes[idx] = target_classes_o
+
+        target_classes = target_classes.to(confidence_scores.dtype)
+        loss_confi = F.binary_cross_entropy(confidence_scores.view(-1).sigmoid(), target_classes.view(-1))
+        losses = {'loss_confi': loss_confi}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, log=False):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
@@ -87,10 +97,11 @@ class SetCriterion(nn.Module):
                 target_boxes.append(torch.cat([t["boxes"][person_id], t["boxes"][object_id]]))
         target_boxes = torch.stack(target_boxes, dim=0)
         
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        loss_pbbox = F.l1_loss(src_boxes[:, :4], target_boxes[:, :4], reduction='none')
+        loss_obbox = F.l1_loss(src_boxes[:, 4:], target_boxes[:, 4:], reduction='none')
 
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        losses['loss_bbox'] = loss_pbbox.sum() / num_boxes + loss_obbox.sum() / num_boxes
 
         loss_pgiou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes[:, :4]),
@@ -118,6 +129,7 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'boxes': self.loss_boxes,
+            "confidences": self.loss_confidences,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -144,4 +156,4 @@ class SetCriterion(nn.Module):
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
 
-        return losses
+        return losses, indices
