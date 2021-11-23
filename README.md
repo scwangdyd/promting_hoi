@@ -15,7 +15,7 @@ The experiments are mainly conducted on HICO-DET and SWIG-HOI dataset. We follow
 ## Training
 To train a model, run
 ```
-python -m torch.distributed.launch --nproc_per_node=4 --use_env main.py --batch_size 36 --output_dir [path to save checkpoint] --epochs 100 --lr_drop 75 --hoi_token_length 10 --dataset_file swig [or hico]
+python -m torch.distributed.launch --nproc_per_node=4 --use_env main.py --batch_size 32 --output_dir [path to save checkpoint] --epochs 100 --lr_drop 75 --hoi_token_length 10 --dataset_file swig [or hico]
 ```
 
 ## Inference
