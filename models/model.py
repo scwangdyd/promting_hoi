@@ -263,11 +263,11 @@ def build_model(args):
     if args.clip_model in _MODELS:
         model_path = _download(_MODELS[args.clip_model], os.path.expanduser("~/.cache/clip"))
         clip_model = torch.jit.load(model_path).eval()
-        # model.load_state_dict(clip_model.state_dict(), strict=False)
+        # Copy the pretrained CLIP parameters as the initilized weights for our newly added modules. 
         state_dict = clip_model.state_dict()
         for n, p in model.named_parameters():
-            if "cross_attn" in n:
-                copy_n = n.replace("cross_attn", "attn")
+            if "hoi_cross_attn" in n:
+                copy_n = n.replace("hoi_cross_attn", "attn")
                 state_dict.update({n: state_dict[copy_n].clone()})
         model.load_state_dict(state_dict, strict=False)
     
