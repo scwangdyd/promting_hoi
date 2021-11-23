@@ -11,17 +11,15 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
+    def __init__(self, matcher, weight_dict, eos_coef, losses):
         """ Create the criterion.
         Parameters:
-            num_classes: number of object categories, omitting the special no-object category
             matcher: module able to compute a matching between targets and proposals
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__()
-        self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
@@ -34,15 +32,22 @@ class SetCriterion(nn.Module):
         assert 'logits_per_hoi' in outputs
         src_logits = outputs['logits_per_hoi']
 
-        target_classes_i = []
         if self.training:
-            offset = 0
+            unique_hois, cnt = {}, 0 # Get unique hoi ids in the mini-batch
+            for t in targets:
+                for hoi in t["hois"]:
+                    hoi_id = hoi["hoi_id"]
+                    if hoi_id not in unique_hois:
+                        unique_hois[hoi_id] = cnt
+                        cnt += 1
+            target_classes_i = []
             for t, (_, indices_per_t) in zip(targets, indices):
                 for i in indices_per_t:
-                    target_classes_i.append(i + offset)
-                offset += len(t["hois"])
+                    hoi_id = t["hois"][i]["hoi_id"]
+                    target_classes_i.append(unique_hois[hoi_id])
             target_classes_i = torch.as_tensor(target_classes_i).to(src_logits.device)
         else:
+            target_classes_i = []
             for t, (_, indices_per_t) in zip(targets, indices):
                 for i in indices_per_t:
                     target_classes_i.append(t["hois"][int(i)]["hoi_id"])
@@ -50,19 +55,45 @@ class SetCriterion(nn.Module):
 
         idx = self._get_src_permutation_idx(indices)
         loss_i = F.cross_entropy(src_logits[idx], target_classes_i)
+
         if self.training:
-            mapper = {int(t): i for i, t in enumerate(target_classes_i)}
-            target_classes_t = [mapper[t] for t in range(len(target_classes_i))]
-            target_classes_t = torch.as_tensor(target_classes_t).to(src_logits.device)
-            loss_t = F.cross_entropy(src_logits[idx].t(), target_classes_t)
-            losses = {'loss_ce': (loss_i + loss_t) / 2}
+            target_classes_t = torch.zeros((len(idx[0]), len(unique_hois)), dtype=torch.int64).to(src_logits.device)
+            for i, cls_id in zip(range(len(target_classes_i)), target_classes_i):
+                target_classes_t[i, cls_id] = 1
+            
+            loss_t = self.masked_out_cross_entropy(src_logits[idx].t(), target_classes_t.t())
+            losses = {"loss_ce": (loss_i + loss_t) / 2}
         else:
-            losses = {'loss_i': loss_i}
+            losses = {'loss_ce': loss_i}
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_i)[0]
         return losses
+
+    def masked_out_cross_entropy(self, src_logits, target_classes):
+        loss = 0
+        num_pos = target_classes.sum(dim=-1)
+        # If there is only one active positive label, then this will be ordinary cross entropy
+        indices = torch.nonzero(num_pos < 2, as_tuple=True)[0]
+        targets_one_pos = torch.argmax(target_classes[indices], dim=-1)
+        loss += F.cross_entropy(src_logits[indices], targets_one_pos, reduction="sum")
+        
+        # If there are multiple positive labels, then we compute them one by one. Each time,
+        # the other positive labels are masked out.
+        indices = torch.nonzero(num_pos > 1, as_tuple=True)[0]
+        for i in indices:
+            t = target_classes[i]
+            cnt = sum(t)
+            loss_t = 0
+            for j in torch.nonzero(t):
+                mask = (t == 0)
+                mask[j] = True
+                tgt = t[mask].argmax(dim=-1, keepdim=True)
+                loss_t += F.cross_entropy(src_logits[i:i+1, mask], tgt, reduction="sum")
+            loss += (loss_t / cnt)
+        loss = loss / len(src_logits)
+        return loss
 
     def loss_confidences(self, outputs, targets, indices, num_boxes, log=True):
         """Confidence score for the interaction prediction.

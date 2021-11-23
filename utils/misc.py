@@ -264,7 +264,7 @@ def get_sha():
 
 def collate_fn(batch):
     batch = list(zip(*batch))
-    batch[0] = nested_tensor_from_tensor_list(batch[0])
+    batch = nested_tensor_from_tensor_list(batch)
     return tuple(batch)
 
 
@@ -277,7 +277,9 @@ def _max_by_axis(the_list):
     return maxes
 
 
-def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
+def nested_tensor_from_tensor_list(batch):
+    tensor_list = batch[0]
+    target_list = batch[1]
     # TODO make this more general
     if tensor_list[0].ndim == 3:
         if torchvision._is_tracing():
@@ -299,7 +301,14 @@ def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
             m[: img.shape[1], :img.shape[2]] = False
     else:
         raise ValueError('not supported')
-    return NestedTensor(tensor, mask)
+    
+    if "image_mask" in target_list[0]:
+        # merge the masks
+        for i in range(len(target_list)):
+            preprocess_img_mask = target_list[i].pop("image_mask")
+            mask[i] = torch.logical_or(mask[i], preprocess_img_mask)
+
+    return [NestedTensor(tensor, mask), target_list]
 
 
 # _onnx_nested_tensor_from_tensor_list() is an implementation of

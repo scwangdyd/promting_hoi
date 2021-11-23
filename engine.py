@@ -14,6 +14,7 @@ import utils.box_ops as box_ops
 from clip import clip
 from clip.model import convert_weights
 from utils.swig_evaluator import SWiGEvaluator
+from utils.hico_evaluator import HICOEvaluator
 from utils.visualize import visualize_preds
 from cascade_hoist.layers import batched_nms
 import torch.nn.functional as F
@@ -26,19 +27,20 @@ def prepare_inputs(images, targets, device):
     images = images.to(device)
     targets = [{k: v.to(device) if k != "hois" else v for k, v in t.items()} for t in targets]
 
-    # texts = []
-    # for t in targets:
-    #     for hoi in t["hois"]:
-    #         texts.append(hoi["text"])
-    # # texts.append("This is a useless predictions and can be ignored")
-    # text_tokens = torch.cat([clip.tokenize(s) for s in texts]).to(device)
-    
     sot_token = _tokenizer.encoder["<|startoftext|>"]
     eot_token = _tokenizer.encoder["<|endoftext|>"]
 
     texts = []
+    text_inputs = []
+    unique_hois = set()
     for t in targets:
         for hoi in t["hois"]:
+            # Ensure all texts are unique (no duplicates).
+            hoi_id = hoi["hoi_id"]
+            if hoi_id in unique_hois:
+                continue
+            else:
+                unique_hois.add(hoi_id)
             action_text, object_text = hoi["text"]
             action_token = _tokenizer.encode(action_text)
             object_token = _tokenizer.encode(object_text)
@@ -46,6 +48,7 @@ def prepare_inputs(images, targets, device):
             action_token = torch.as_tensor([sot_token] + action_token, dtype=torch.long).to(device)
             object_token = torch.as_tensor(object_token + [eot_token], dtype=torch.long).to(device)
             texts.append([action_token, object_token])
+            text_inputs.append(action_text + " " + object_text)
     
     return images, targets, texts
 
@@ -61,13 +64,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
-    for images, targets in metric_logger.log_every(data_loader, print_freq, header):
-        
-        # visualize_targets(images, targets)
-        
+    for images, targets in metric_logger.log_every(data_loader, print_freq, header): 
+               
         images, targets, texts = prepare_inputs(images, targets, device)
-
-        # outputs = model(images.tensors, text_tokens, images.mask)
         outputs = model(images.tensors, texts, images.mask)
         loss_dict, indices = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
@@ -115,16 +114,18 @@ def evaluate(model, criterion, data_loader, device, args):
     header = 'Test:'
 
     convert_weights(model)
-    
-    # text_features, text_inputs, indices_mapper = prepare_text_inputs(args, model, data_loader.dataset.texts)
-    text_features = prepare_text_inputs(model, data_loader.dataset.dataset_texts, device)
 
     if args.dataset_file == "swig":
         anno_file = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"
         evaluator = SWiGEvaluator(anno_file, args.output_dir)
-    # coco_evaluator = CocoEvaluator(base_ds, iou_types)
-    # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
+    if args.dataset_file == "hico":
+        anno_file = "/raid1/suchen/repo/promting_hoi/data/HICO-DET/test_hico_ann.json"
+        evaluator = HICOEvaluator(anno_file, args.output_dir)
+    else:
+        raise NotImplementedError
 
+    text_features = prepare_text_inputs(model, data_loader.dataset.dataset_texts, device)
+    
     for images, targets in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device)
         targets = [{k: v.to(device) if k != "hois" else v for k, v in t.items()} for t in targets]
@@ -136,10 +137,12 @@ def evaluate(model, criterion, data_loader, device, args):
         conf_scores = model.hoi_confidence_embed(F.relu(conf_features))
         logits_per_hoi = model.logit_scale.exp() * hoi_features @ text_features.t()
         
-        outputs = {"logits_per_hoi": logits_per_hoi, "pred_boxes": pred_boxes, "confidence_scores": conf_scores}
+        outputs = {"logits_per_hoi": logits_per_hoi, "pred_boxes": pred_boxes, "confidence_scores": conf_scores, "attention_maps": attn_maps}
         
         loss_dict, indices = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
+
+        # visualize_preds(images, targets, outputs, indices)
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
@@ -154,12 +157,13 @@ def evaluate(model, criterion, data_loader, device, args):
 
         results = {int(targets[i]["image_id"]):
             postprocessing(
-                logits_per_hoi[i], # [indices[i][0]]
+                logits_per_hoi[i],
                 conf_scores[i],
                 pred_boxes[i],
                 images.mask[i],
                 targets[i]["orig_size"],
                 data_loader.dataset.text_mapper,
+                args.test_score_thresh,
             ) for i in range(len(images.mask))
         }
         
@@ -197,8 +201,7 @@ def prepare_text_inputs(model, texts, device):
     return text_features
 
 
-def postprocessing(hoi_scores, conf_scores, pred_boxes, img_mask, orig_size, indices_mapper):
-    test_thresh = 0.0005
+def postprocessing(hoi_scores, conf_scores, pred_boxes, img_mask, orig_size, indices_mapper, test_thresh=0.001):
     hoi_scores = hoi_scores.softmax(dim=-1)
     conf_scores = conf_scores.sigmoid()
     scores = hoi_scores * conf_scores
@@ -270,59 +273,3 @@ def postprocessing_boxes(pred_boxes, img_mask, orig_size):
     pred_object_boxes[:, 0::2] *= ratio
     pred_object_boxes[:, 1::2] *= ratio
     return pred_person_boxes, pred_object_boxes
-
-
-# def prepare_text_inputs(args, model):
-#     """ Encode the classes using pre-trained CLIP text encoder. """
-#     from utils.hico_categories import HICO_INTERACTIONS, VERB_MAPPER
-#     from utils.swig_v1_categories import SWIG_ACTIONS, SWIG_CATEGORIES, SWIG_INTERACTIONS
-    
-#     device = "cuda" if torch.cuda.is_available() else "cpu"
-#     if args.dataset_file == "hico":
-#         text_inputs = []
-#         indices_mapper = {}
-#         for i, hoi in enumerate(HICO_INTERACTIONS):
-#             act = hoi["action"]
-#             if act == "no_interaction":
-#                 continue
-#             act = act.split("_")
-#             act[0] = VERB_MAPPER[act[0]]
-#             act = " ".join(act)
-#             obj = hoi["object"]
-#             s = f"a photo of people {act} {obj}."
-#             indices_mapper[len(text_inputs)] = i
-#             text_inputs.append(s)
-    
-#     elif args.dataset_file == "swig":
-#         text_inputs = []
-#         indices_mapper = {}
-#         text_freq = {}
-#         for i, hoi in enumerate(SWIG_INTERACTIONS):
-#             if hoi["evaluation"] == 0: continue
-#             action_id = hoi["action_id"]
-#             object_id = hoi["object_id"]
-            
-#             act = SWIG_ACTIONS[action_id]["name"]
-#             obj = SWIG_CATEGORIES[object_id]["name"]
-#             act_def = SWIG_ACTIONS[action_id]["def"]
-#             obj_def = SWIG_CATEGORIES[object_id]["def"]
-#             obj_gloss = SWIG_CATEGORIES[object_id]["gloss"]
-#             obj_gloss = [obj] + [x for x in obj_gloss if x != obj]
-#             if len(obj_gloss) > 1:
-#                 obj_gloss = " or ".join(obj_gloss)
-#             else:
-#                 obj_gloss = obj_gloss[0]
-#             # s = f"A photo of a person {act} with object {obj}. The object {obj} means {obj_def}."
-#             # s = f"a photo of a person {act} with object {obj}"
-#             # s = f"A photo of a person {act} with {obj}. The {act} means to {act_def}."
-#             s = f"A photo of a person {act} with {obj_gloss}. The {act} means to {act_def}."
-#             indices_mapper[len(text_inputs)] = i
-#             text_freq[s] = hoi["frequency"]
-#             text_inputs.append(s)
-    
-#     text_tokens = torch.cat([clip.tokenize(s) for s in text_inputs]).to(device)
-#     with torch.no_grad():
-#         text_features = model.encode_text(text_tokens)
-#         text_features /= text_features.norm(dim=-1, keepdim=True)
-#     return text_features, text_inputs, indices_mapper
-

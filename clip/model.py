@@ -215,11 +215,13 @@ class Transformer(nn.Module):
 
 
 class HOIResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
-
-        self.hoi_attn = nn.MultiheadAttention(d_model, n_head)
+        
+        self.hoi_attn = nn.MultiheadAttention(d_model, n_head, dropout=0.1)
+        self.hoi_cross_attn = nn.MultiheadAttention(d_model, n_head, dropout=0.1)
         self.attn = nn.MultiheadAttention(d_model, n_head)
+        
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -227,6 +229,7 @@ class HOIResidualAttentionBlock(nn.Module):
             ("c_proj", nn.Linear(d_model * 4, d_model))
         ]))
         self.ln_2 = LayerNorm(d_model)
+        self.attn_mask = attn_mask
         
         self.hoi_ln1 = LayerNorm(d_model)
         self.hoi_ln2 = LayerNorm(d_model)
@@ -238,27 +241,33 @@ class HOIResidualAttentionBlock(nn.Module):
         return self.attn(x, x, x, need_weights=False, key_padding_mask=mask)[0]
 
     def hoi_attention(self, y: torch.Tensor, attn_mask: torch.Tensor = None):
-        return self.hoi_attn(y, y, y, need_weights=False, attn_mask=attn_mask)[0]
+        self.attn_mask = self.attn_mask.to(dtype=y.dtype, device=y.device) if self.attn_mask is not None else None
+        y, attn_map = self.hoi_attn(y, y, y, attn_mask=self.attn_mask)
+        return y
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None):
-        # Cross self-attn
-        y = y + self.dropout1(self.hoi_attention(self.hoi_ln1(y)))
-        y2, attn_map = self.attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), key_padding_mask=mask)
+        
+        y2, attn_map = self.hoi_cross_attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), key_padding_mask=mask)
         y = y + self.dropout2(y2)
         y = y + self.dropout3(self.mlp(self.ln_2(y)))
 
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
+        
+        # Cross self-attn
+        y = torch.cat([x[0:1], y], dim=0)
+        y = y + self.dropout1(self.hoi_attention(self.hoi_ln1(y)))
+        y = y[1:]
 
         return x, y, attn_map
 
 
 class HOITransformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor=None):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[HOIResidualAttentionBlock(width, heads) for _ in range(layers)])
+        self.resblocks = nn.Sequential(*[HOIResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None):
         for resblock in self.resblocks:
@@ -276,6 +285,7 @@ class HOIVisionTransformer(nn.Module):
         heads: int,
         output_dim: int,
         hoi_token_length: int = 5,
+        attn_mask: torch.Tensor = None,
     ):
         super().__init__()
         self.input_resolution = input_resolution
@@ -289,7 +299,7 @@ class HOIVisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
-        self.transformer = HOITransformer(width, layers, heads)
+        self.transformer = HOITransformer(width, layers, heads, attn_mask)
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))

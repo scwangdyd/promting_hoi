@@ -1,10 +1,13 @@
 import collections
 import numpy as np
 import json
+import os
+import pickle
 from .hico_categories import HICO_INTERACTIONS, HICO_ACTIONS, HICO_OBJECTS
+from .hico_categories import ZERO_SHOT_INTERACTION_IDS
 
 
-def eval(predictions, gts):
+def hico_evaluation(predictions, gts):
     images, results = [], []
     for img_key, ps in predictions.items():
         images.extend([img_key] * len(ps))
@@ -148,3 +151,79 @@ def prepare_hico_gts(anno_file):
             gts[hoi_id][img_id] = np.array(gts[hoi_id][img_id])
     
     return gts
+
+
+class HICOEvaluator(object):
+    def __init__(self, anno_file, output_dir):
+        size = 600
+        self.size = size
+        self.gts = self.load_anno(anno_file)
+        self.scores = {i: [] for i in range(size)}
+        self.boxes = {i: [] for i in range(size)}
+        self.keys = {i: [] for i in range(size)}
+        self.hico_ap  = np.zeros(size)
+        self.hico_rec = np.zeros(size)
+        self.output_dir = output_dir
+        
+    def update(self, predictions):
+        # update predictions
+        for img_id, preds in predictions.items():
+            for pred in preds:
+                hoi_id = pred[0]
+                score = pred[1]
+                boxes = pred[2:]
+                self.scores[hoi_id].append(score)
+                self.boxes[hoi_id].append(boxes)
+                self.keys[hoi_id].append(img_id)
+
+    def accumulate(self):
+        for hoi_id in range(600):
+            gts_per_hoi = self.gts[hoi_id]
+            ap, rec = calc_ap(self.scores[hoi_id], self.boxes[hoi_id], self.keys[hoi_id], gts_per_hoi)
+            self.hico_ap[hoi_id], self.hico_rec[hoi_id] = ap, rec
+            
+    def summarize(self):
+        zero_inters = ZERO_SHOT_INTERACTION_IDS
+        zero_inters = np.asarray(zero_inters)
+        seen_inters = np.setdiff1d(np.arange(600), zero_inters)
+        zs_mAP = np.mean(self.hico_ap[zero_inters])
+        sn_mAP = np.mean(self.hico_ap[seen_inters])
+        print("zero-shot mAP: {:.2f}".format(zs_mAP * 100.))
+        print("seen mAP: {:.2f}".format(sn_mAP * 100.))
+        print("full mAP: {:.2f}".format(np.mean(self.hico_ap) * 100.))
+            
+    def save_preds(self):
+        with open(os.path.join(self.output_dir, "preds.pkl"), "wb") as f:
+            pickle.dump({"scores": self.scores, "boxes": self.boxes, "keys": self.keys}, f)
+            
+    def save(self):
+        with open(os.path.join(self.output_dir, "dets.pkl"), "wb") as f:
+            pickle.dump({"gts": self.gts, "scores": self.scores, "boxes": self.boxes, "keys": self.keys}, f)
+            
+    def load_anno(self, anno_file):
+        with open(anno_file, "r") as f:
+            dataset_dicts = json.load(f)
+        
+        action_id2name = {x["id"]: x["name"] for x in HICO_ACTIONS}
+        object_id2name = {x["id"]: x["name"] for x in HICO_OBJECTS}
+        hoi_mapper = {(x["action"], x["object"]): x["interaction_id"] for x in HICO_INTERACTIONS}
+        
+        size = self.size
+        gts = {i: collections.defaultdict(list) for i in range(size)}
+        for anno_dict in dataset_dicts:
+            image_id = anno_dict["img_id"]
+            box_annos = anno_dict.get("annotations", [])
+            hoi_annos = anno_dict.get("hoi_annotation", [])
+            for hoi in hoi_annos:
+                person_box = box_annos[hoi["subject_id"]]["bbox"]
+                object_box = box_annos[hoi["object_id"]]["bbox"]
+                action_id = hoi["category_id"] - 1 # start from 1
+                object_id = box_annos[hoi["object_id"]]["category_id"] # start from 1
+                hoi_id = hoi_mapper[(action_id2name[action_id], object_id2name[object_id])]
+                gts[hoi_id][image_id].append(person_box + object_box)
+                
+        for hoi_id in gts:
+            for img_id in gts[hoi_id]:
+                gts[hoi_id][img_id] = np.array(gts[hoi_id][img_id])
+        
+        return gts

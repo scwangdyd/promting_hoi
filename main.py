@@ -73,7 +73,8 @@ def get_args_parser():
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
-
+    parser.add_argument('--test_score_thresh', default=0.001, type=float,
+                        help="threshold to filter out HOI predictions")
     # dataset parameters
     parser.add_argument('--dataset_file', default='swig')
     parser.add_argument('--output_dir', default='',
@@ -92,6 +93,7 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--local_rank', help='url used to set up distributed training')
     return parser
 
 
@@ -116,28 +118,32 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
     # Frozen CLIP model
-    update_modules = set([n for n, p in model_without_ddp.named_parameters() if "hoi" in n or "bbox" in n])
-    frozen_modules = set([n for n, p in model_without_ddp.named_parameters() if n not in update_modules])
+    update_modules = [n for n, p in model_without_ddp.named_parameters() if "hoi" in n or "bbox" in n]
+    frozen_modules = [n for n, p in model_without_ddp.named_parameters() if n not in update_modules]
+    
+    for n, p in model_without_ddp.named_parameters():
+        if n in frozen_modules:
+            p.requires_grad = False
     
     param_dicts = [
         {
             "params": [p for n, p in model_without_ddp.named_parameters() if n in update_modules and p.requires_grad],
             "lr": args.lr
         },
-        {
-            "params": [p for n, p in model_without_ddp.named_parameters() if n in frozen_modules and p.requires_grad],
-            "lr": 0.,
-        },
+        # {
+        #     "params": [p for n, p in model_without_ddp.named_parameters() if n in frozen_modules and p.requires_grad],
+        #     "lr": 0.,
+        # },
     ]
 
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    # optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model_without_ddp.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
     dataset_train = build_dataset(image_set='train', args=args)
@@ -172,17 +178,12 @@ def main(args):
             checkpoint = torch.load(args.resume, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            # checkpoint['optimizer']["param_groups"][0]["lr"] = 0.0001
             optimizer.load_state_dict(checkpoint['optimizer'])
-            # checkpoint["lr_scheduler"]["step_size"] = args.lr_drop
-            # checkpoint["lr_scheduler"]["_last_lr"] = [0.0001, 0.0]
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
         test_stats, evaluator = evaluate(model, criterion, data_loader_val, device, args)
-        # if args.output_dir:
-        #     utils.save_on_master(evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
 
     print("Start training")
@@ -208,10 +209,6 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        # test_stats, coco_evaluator = evaluate(
-        #     model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-        # )
-
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
@@ -219,17 +216,6 @@ def main(args):
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-
-            # for evaluation logs
-            # if coco_evaluator is not None:
-            #     (output_dir / 'eval').mkdir(exist_ok=True)
-            #     if "bbox" in coco_evaluator.coco_eval:
-            #         filenames = ['latest.pth']
-            #         if epoch % 50 == 0:
-            #             filenames.append(f'{epoch:03}.pth')
-            #         for name in filenames:
-            #             torch.save(coco_evaluator.coco_eval["bbox"].eval,
-            #                        output_dir / "eval" / name)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

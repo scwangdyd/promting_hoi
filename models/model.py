@@ -39,11 +39,12 @@ class CLIP_HOI_PROMPTER(nn.Module):
         transformer_heads: int,
         transformer_layers: int,
         prefix_length: int = 8,
-        conjun_length: int = 2,
+        conjun_length: int = 4,
     ):
         super().__init__()
         
         self.context_length = context_length
+        self.hoi_token_length = hoi_token_length
         
         # Vision
         vision_heads = vision_width // 64
@@ -55,6 +56,7 @@ class CLIP_HOI_PROMPTER(nn.Module):
             heads=vision_heads,
             output_dim=embed_dim,
             hoi_token_length=hoi_token_length,
+            attn_mask=self.build_hoi_attention_mask()
         )
         self.bbox_embed = MLP(embed_dim, embed_dim, 8, 3)
         self.hoi_confidence_embed = nn.Linear(embed_dim, 1)
@@ -111,6 +113,14 @@ class CLIP_HOI_PROMPTER(nn.Module):
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
         mask = torch.empty(self.context_length, self.context_length)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)  # zero out the lower diagonal
+        return mask
+    
+    def build_hoi_attention_mask(self):
+        # lazily create causal attention mask, with full attention between the vision tokens
+        # pytorch uses additive attention mask; fill with -inf
+        mask = torch.empty(self.hoi_token_length + 1, self.hoi_token_length + 1)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
         return mask
@@ -229,12 +239,6 @@ class PostProcess(nn.Module):
 
 
 def build_model(args):
-    if args.dataset_file == "hico":
-        num_classes = 80
-        num_actions = 117
-    if args.dataset_file == "swig":
-        num_classes = 1000
-        num_actions = 407
 
     device = torch.device(args.device)
 
@@ -259,7 +263,13 @@ def build_model(args):
     if args.clip_model in _MODELS:
         model_path = _download(_MODELS[args.clip_model], os.path.expanduser("~/.cache/clip"))
         clip_model = torch.jit.load(model_path).eval()
-        model.load_state_dict(clip_model.state_dict(), strict=False)
+        # model.load_state_dict(clip_model.state_dict(), strict=False)
+        state_dict = clip_model.state_dict()
+        for n, p in model.named_parameters():
+            if "cross_attn" in n:
+                copy_n = n.replace("cross_attn", "attn")
+                state_dict.update({n: state_dict[copy_n].clone()})
+        model.load_state_dict(state_dict, strict=False)
     
     if args.pretrained:
         checkpoint = torch.load(args.pretrained, map_location='cpu')
@@ -271,7 +281,6 @@ def build_model(args):
 
     losses = ['labels', 'boxes', "confidences"]
     criterion = SetCriterion(
-        num_classes,
         matcher=matcher,
         weight_dict=weight_dict,
         eos_coef=args.eos_coef,

@@ -69,15 +69,24 @@ class HungarianMatcher(nn.Module):
         # Also concat the target labels and boxes. During the training, due to the limit
         # GPU memory, we also consider the texts within each mini-batch. Differently, during
         # the inference, we consider all interactions in the dataset.
-        tgt_ids, tgt_bbox = [], []
+        unique_hois, cnt = {}, 0
+        tgt_ids = []
         for t in targets:
             for hoi in t["hois"]:
-                person_id = hoi["subject_id"]
-                object_id = hoi["object_id"]
-                tgt_bbox.append(torch.cat([t["boxes"][person_id], t["boxes"][object_id]]))
-                tgt_ids.append(len(tgt_ids) if self.training else hoi["hoi_id"])
-
+                hoi_id = hoi["hoi_id"]
+                if self.training:
+                    # Only consider the texts within each mini-batch
+                    if hoi_id not in unique_hois:
+                        unique_hois[hoi_id] = cnt
+                        cnt += 1
+                    tgt_ids.append(unique_hois[hoi_id])
+                else:
+                    # Consider all hois in the dataset
+                    tgt_ids.append(hoi_id)
         tgt_ids = torch.as_tensor(tgt_ids, dtype=torch.int64, device=out_prob.device)
+
+        tgt_bbox = [torch.cat([t["boxes"][hoi["subject_id"]], t["boxes"][hoi["object_id"]]])
+                    for t in targets for hoi in t["hois"]]
         tgt_bbox = torch.stack(tgt_bbox, dim=0)
 
         # Compute the classification cost. Contrary to the loss, we don't use the NLL,

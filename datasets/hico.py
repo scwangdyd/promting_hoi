@@ -1,5 +1,5 @@
 """
-SWiG-HOI dataset which returns image_id for evaluation.
+HICO-DET dataset which returns image_id for evaluation.
 """
 import os
 import json
@@ -8,23 +8,24 @@ import torch.utils.data
 from torchvision.datasets import CocoDetection
 import datasets.transforms as T
 from PIL import Image
-from .swig_v1_categories import SWIG_INTERACTIONS, SWIG_ACTIONS, SWIG_CATEGORIES
+from .hico_categories import HICO_INTERACTIONS, HICO_ACTIONS, HICO_OBJECTS, ZERO_SHOT_INTERACTION_IDS
 from utils.sampler import repeat_factors_from_category_frequency, get_dataset_indices
 
-HOI_MAPPER = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
+id_to_contiguous_id_map = {x["id"]: i for i, x in enumerate(HICO_OBJECTS)}
+action_object_to_hoi_id = {(x["action"], x["object"]): x["interaction_id"] for x in HICO_INTERACTIONS}
 
-class SWiGHOIDetection(CocoDetection):
-    def __init__(self, img_folder, ann_file, transforms, image_set):
+class HICO(CocoDetection):
+    def __init__(self, img_folder, ann_file, transforms, image_set, zero_shot_exp):
         self.root = img_folder
         self.transforms = transforms
         # Text description of human-object interactions
-        dataset_texts, text_mapper = prepare_dataset_text(image_set)
+        dataset_texts, text_mapper = prepare_dataset_text()
         self.dataset_texts = dataset_texts
         self.text_mapper = text_mapper
         # Load dataset
         repeat_factor_sampling = True if image_set == "train" else False
-        reverse_text_mapper = {v: k for k, v in text_mapper.items()}
-        self.dataset_dicts = load_swig_json(ann_file, img_folder, reverse_text_mapper, repeat_factor_sampling)
+        load_zero_shot = False if zero_shot_exp and image_set == "train" else True
+        self.dataset_dicts = load_hico_json(ann_file, img_folder, repeat_factor_sampling, load_zero_shot)
 
     def __getitem__(self, idx: int):
         
@@ -43,14 +44,12 @@ class SWiGHOIDetection(CocoDetection):
         boxes[:, 1::2].clamp_(min=0, max=h)
 
         classes = torch.tensor(annos["classes"], dtype=torch.int64)
-        aux_classes = torch.tensor(annos["aux_classes"], dtype=torch.int64)
 
         target = {
             "image_id": torch.tensor(image_id),
             "orig_size": torch.tensor([h, w]),
             "boxes": boxes,
             "classes": classes,
-            "aux_classes": aux_classes,
             "hois": annos["hois"],
         }
         
@@ -63,7 +62,12 @@ class SWiGHOIDetection(CocoDetection):
         return len(self.dataset_dicts)
     
 
-def load_swig_json(json_file, image_root, text_mapper, repeat_factor_sampling=False):
+def load_hico_json(
+    json_file,
+    image_root,
+    repeat_factor_sampling=False,
+    load_zero_shot=True
+):
     """
     Load a json file with HOI's instances annotation.
 
@@ -89,87 +93,59 @@ def load_swig_json(json_file, image_root, text_mapper, repeat_factor_sampling=Fa
         record["height"] = anno_dict["height"]
         record["width"] = anno_dict["width"]
         record["image_id"] = anno_dict["img_id"]
-        
-        if len(anno_dict["box_annotations"]) == 0 or len(anno_dict["hoi_annotations"]) == 0:
+
+        if len(anno_dict["annotations"]) == 0 or len(anno_dict["hoi_annotation"]) == 0:
             images_without_valid_annotations.append(anno_dict)
             continue
 
-        boxes = [obj["bbox"] for obj in anno_dict["box_annotations"]]
-        classes = [obj["category_id"] for obj in anno_dict["box_annotations"]]
-        aux_classes = []
-        for obj in anno_dict["box_annotations"]:
-            aux_categories = obj["aux_category_id"]
-            while len(aux_categories) < 3:
-                aux_categories.append(-1)
-            aux_classes.append(aux_categories)
-
-        for hoi in anno_dict["hoi_annotations"]:
+        boxes = [obj["bbox"] for obj in anno_dict["annotations"]]
+        classes = [obj["category_id"] for obj in anno_dict["annotations"]]
+        hoi_annotations = []
+        for hoi in anno_dict["hoi_annotation"]:
+            action_id = hoi["category_id"] - 1 # Starting from 1
             target_id = hoi["object_id"]
-            object_id = classes[target_id]
-            action_id = hoi["action_id"]
-            hoi["text"] = generate_text(action_id, object_id)
-            continguous_id = HOI_MAPPER[(action_id, object_id)]
-            hoi["hoi_id"] = text_mapper[continguous_id]
+            object_id = id_to_contiguous_id_map[classes[target_id]]
+            text = (HICO_ACTIONS[action_id]["name"], HICO_OBJECTS[object_id]["name"])
+            hoi_id = action_object_to_hoi_id[text]
+            
+            # Ignore this annotation if we conduct zero-shot simulation experiments
+            if (not load_zero_shot) and (hoi_id in ZERO_SHOT_INTERACTION_IDS):
+                continue
+            
+            hoi_annotations.append({
+                "subject_id": hoi["subject_id"],
+                "object_id": hoi["object_id"],
+                "action_id": action_id,
+                "hoi_id": hoi_id,
+                "text": text
+            })
 
+        if (not load_zero_shot) and len(hoi_annotations) == 0:
+            continue
+        
         targets = {
             "boxes": boxes,
             "classes": classes,
-            "aux_classes": aux_classes,
-            "hois": anno_dict["hoi_annotations"],
+            "hois": hoi_annotations,
         }
 
         record["annotations"] = targets
         dataset_dicts.append(record)
 
     if repeat_factor_sampling:
-        repeat_factors = repeat_factors_from_category_frequency(dataset_dicts, repeat_thresh=0.0001)
+        repeat_factors = repeat_factors_from_category_frequency(dataset_dicts, repeat_thresh=0.003)
         dataset_indices = get_dataset_indices(repeat_factors)
         dataset_dicts = [dataset_dicts[i] for i in dataset_indices]
     return dataset_dicts
 
 
-def generate_text(action_id, object_id):
-    act = SWIG_ACTIONS[action_id]["name"]
-    obj = SWIG_CATEGORIES[object_id]["name"]
-    act_def = SWIG_ACTIONS[action_id]["def"]
-    obj_def = SWIG_CATEGORIES[object_id]["def"]
-    obj_gloss = SWIG_CATEGORIES[object_id]["gloss"]
-    obj_gloss = [obj] + [x for x in obj_gloss if x != obj]
-    if len(obj_gloss) > 1:
-        obj_gloss = " or ".join(obj_gloss)
-    else:
-        obj_gloss = obj_gloss[0]
-
-    # s = [act, obj_gloss]
-    s = [act, obj]
-    return s
-
-# def generate_text(action_id, object_id):
-#     act = SWIG_ACTIONS[action_id]["name"]
-#     obj = SWIG_CATEGORIES[object_id]["name"]
-#     act_def = SWIG_ACTIONS[action_id]["def"]
-#     obj_def = SWIG_CATEGORIES[object_id]["def"]
-#     obj_gloss = SWIG_CATEGORIES[object_id]["gloss"]
-#     obj_gloss = [obj] + [x for x in obj_gloss if x != obj]
-#     if len(obj_gloss) > 1:
-#         obj_gloss = " or ".join(obj_gloss)
-#     else:
-#         obj_gloss = obj_gloss[0]
-#     # s = f"A photo of a person {act} with object {obj}. The object {obj} means {obj_def}."
-#     # s = f"a photo of a person {act} with object {obj}"
-#     # s = f"A photo of a person {act} with {obj}. The {act} means to {act_def}."
-#     s = f"A photo of a person {act} with {obj_gloss}. The {act} means to {act_def}."
-#     return s
-
-
-def prepare_dataset_text(image_set):
+def prepare_dataset_text():
     texts = []
     text_mapper = {}
-    for i, hoi in enumerate(SWIG_INTERACTIONS):
-        if image_set != "train" and hoi["evaluation"] == 0: continue
-        action_id = hoi["action_id"]
-        object_id = hoi["object_id"]
-        s = generate_text(action_id, object_id)
+    for i, hoi in enumerate(HICO_INTERACTIONS):
+        action_name = " ".join(hoi["action"].split("_"))
+        object_name = hoi["object"]
+        s = [action_name, object_name]
         text_mapper[len(texts)] = i
         texts.append(s)
     return texts, text_mapper
@@ -189,7 +165,7 @@ def make_transforms(image_set):
             T.RandomSelect(
                 T.ResizeAndCenterCrop(224),
                 T.Compose([
-                    T.RandomCrop_InteractionConstraint((0.8, 0.8), 0.9),
+                    T.RandomCrop_InteractionConstraint((0.7, 0.7), 0.9),
                     T.ResizeAndCenterCrop(224)
                 ]),
             ),
@@ -207,19 +183,18 @@ def make_transforms(image_set):
 def build(image_set, args):
 
     PATHS = {
-        "train": ("/raid1/suchen/dataset/swig/images_512",
-                  "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_trainval_1000.json"),
-        "val": ("/raid1/suchen/dataset/swig/images_512",
-                "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"),
-        "dev": ("/raid1/suchen/dataset/swig/images_512",
-                "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"),
+        "train": ("/raid1/suchen/dataset/hico_20160224_det/images/train2015",
+                  "/raid1/suchen/repo/promting_hoi/data/HICO-DET/trainval_hico_ann.json"),
+        "val": ("/raid1/suchen/dataset/hico_20160224_det/images/test2015",
+                "/raid1/suchen/repo/promting_hoi/data/HICO-DET/test_hico_ann.json"),
     }
 
     img_folder, ann_file = PATHS[image_set]
-    dataset = SWiGHOIDetection(
+    dataset = HICO(
         img_folder,
         ann_file,
         transforms=make_transforms(image_set),
-        image_set=image_set
+        image_set=image_set,
+        zero_shot_exp=True,
     )
     return dataset
