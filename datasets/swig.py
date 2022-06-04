@@ -1,5 +1,5 @@
 """
-SWiG-HOI dataset which returns image_id for evaluation.
+SWiG-HOI dataset utils.
 """
 import os
 import json
@@ -11,10 +11,15 @@ from PIL import Image
 from .swig_v1_categories import SWIG_INTERACTIONS, SWIG_ACTIONS, SWIG_CATEGORIES
 from utils.sampler import repeat_factors_from_category_frequency, get_dataset_indices
 
-HOI_MAPPER = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
+# NOTE: Replace the path to your file
+SWIG_ROOT = "/raid1/suchen/dataset/swig/images_512"
+SWIG_TRAIN_ANNO = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_trainval_1000.json"
+SWIG_VAL_ANNO = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"
+SWIG_DEV_ANNO = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"
+
 
 class SWiGHOIDetection(CocoDetection):
-    def __init__(self, img_folder, ann_file, transforms, image_set):
+    def __init__(self, img_folder, ann_file, transforms, image_set, repeat_factor_sampling):
         self.root = img_folder
         self.transforms = transforms
         # Text description of human-object interactions
@@ -22,22 +27,22 @@ class SWiGHOIDetection(CocoDetection):
         self.dataset_texts = dataset_texts
         self.text_mapper = text_mapper
         # Load dataset
-        repeat_factor_sampling = True if image_set == "train" else False
+        repeat_factor_sampling = repeat_factor_sampling and image_set == "train"
         reverse_text_mapper = {v: k for k, v in text_mapper.items()}
         self.dataset_dicts = load_swig_json(ann_file, img_folder, reverse_text_mapper, repeat_factor_sampling)
 
     def __getitem__(self, idx: int):
-        
+
         filename = self.dataset_dicts[idx]["file_name"]
         image = Image.open(filename).convert("RGB")
-        
+
         w, h = image.size
         assert w == self.dataset_dicts[idx]["width"], "image shape is not consistent."
         assert h == self.dataset_dicts[idx]["height"], "image shape is not consistent."
 
         image_id = self.dataset_dicts[idx]["image_id"]
         annos = self.dataset_dicts[idx]["annotations"]
-        
+
         boxes = torch.as_tensor(annos["boxes"], dtype=torch.float32).reshape(-1, 4)
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
@@ -53,7 +58,7 @@ class SWiGHOIDetection(CocoDetection):
             "aux_classes": aux_classes,
             "hois": annos["hois"],
         }
-        
+
         if self.transforms is not None:
             image, target = self.transforms(image, target)
 
@@ -61,7 +66,7 @@ class SWiGHOIDetection(CocoDetection):
 
     def __len__(self):
         return len(self.dataset_dicts)
-    
+
 
 def load_swig_json(json_file, image_root, text_mapper, repeat_factor_sampling=False):
     """
@@ -70,15 +75,34 @@ def load_swig_json(json_file, image_root, text_mapper, repeat_factor_sampling=Fa
     Args:
         json_file (str): full path to the json file in HOI instances annotation format.
         image_root (str or path-like): the directory where the images in this json file exists.
-
+        text_mapper (dict): a dictionary to map text descriptions of HOIs to contiguous ids.
+        repeat_factor_sampling (bool): resampling training data to increase the rate of tail
+            categories to be observed by oversampling the images that contain them.
     Returns:
-        list[dict]: a list of dicts in Detectron2 standard dataset dicts format. (See
-        `Using Custom Datasets </tutorials/datasets.html>`_ )
-
-    Notes:
-        1. This function does not read the image files.
-           The results do not have the "image" field.
+        list[dict]: a list of dicts in the following format.
+        {
+            'file_name': path-like str to load image,
+            'height': 480,
+            'width': 640,
+            'image_id': 222,
+            'annotations': {
+                'boxes': list[list[int]], # n x 4, bounding box annotations
+                'classes': list[int], # n, object category annotation of the bounding boxes
+                'aux_classes': list[list], # n x 3, a list of auxiliary object annotations
+                'hois': [
+                    {
+                        'subject_id': 0,  # person box id (corresponding to the list of boxes above)
+                        'object_id': 1,   # object box id (corresponding to the list of boxes above)
+                        'action_id', 76,  # person action category
+                        'hoi_id', 459,    # interaction category
+                        'text': ('ride', 'skateboard') # text description of human action and object
+                    }
+                ]
+            }
+        }
     """
+    HOI_MAPPER = {(x["action_id"], x["object_id"]): x["id"] for x in SWIG_INTERACTIONS}
+
     imgs_anns = json.load(open(json_file, "r"))
 
     dataset_dicts = []
@@ -89,7 +113,7 @@ def load_swig_json(json_file, image_root, text_mapper, repeat_factor_sampling=Fa
         record["height"] = anno_dict["height"]
         record["width"] = anno_dict["width"]
         record["image_id"] = anno_dict["img_id"]
-        
+
         if len(anno_dict["box_annotations"]) == 0 or len(anno_dict["hoi_annotations"]) == 0:
             images_without_valid_annotations.append(anno_dict)
             continue
@@ -125,6 +149,7 @@ def load_swig_json(json_file, image_root, text_mapper, repeat_factor_sampling=Fa
         repeat_factors = repeat_factors_from_category_frequency(dataset_dicts, repeat_thresh=0.0001)
         dataset_indices = get_dataset_indices(repeat_factors)
         dataset_dicts = [dataset_dicts[i] for i in dataset_indices]
+
     return dataset_dicts
 
 
@@ -144,6 +169,8 @@ def generate_text(action_id, object_id):
     s = [act, obj]
     return s
 
+
+''' deprecated, text
 # def generate_text(action_id, object_id):
 #     act = SWIG_ACTIONS[action_id]["name"]
 #     obj = SWIG_CATEGORIES[object_id]["name"]
@@ -160,6 +187,7 @@ def generate_text(action_id, object_id):
 #     # s = f"A photo of a person {act} with {obj}. The {act} means to {act_def}."
 #     s = f"A photo of a person {act} with {obj_gloss}. The {act} means to {act_def}."
 #     return s
+'''
 
 
 def prepare_dataset_text(image_set):
@@ -175,6 +203,38 @@ def prepare_dataset_text(image_set):
     return texts, text_mapper
 
 
+def make_transforms(image_set, args):
+    normalize = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+    ])
+
+    scales = [224, 256, 288, 320, 352, 384, 416, 448, 480, 512]
+
+    if image_set == "train":
+        return T.Compose([
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(brightness=[0.8, 1.2], contrast=[0.8, 1.2], saturation=[0.8, 1.2]),
+            T.RandomSelect(
+                T.RandomResize(scales, max_size=scales[-1] * 1333 // 800),
+                T.Compose([
+                    T.RandomCrop_InteractionConstraint((0.7, 0.7), 0.9),
+                    T.RandomResize(scales, max_size=scales[-1] * 1333 // 800),
+                ])
+            ),
+            normalize,
+        ])
+
+    if image_set == "val":
+        return T.Compose([
+            T.RandomResize([args.eval_size], max_size=args.eval_size * 1333 // 800),
+            normalize
+        ])
+
+    raise ValueError(f'unknown {image_set}')
+
+
+''' deprecated (Fixed image resolution + random cropping + centering)
 def make_transforms(image_set):
 
     normalize = T.Compose([
@@ -202,24 +262,24 @@ def make_transforms(image_set):
         ])
 
     raise ValueError(f'unknown {image_set}')
+'''
 
 
 def build(image_set, args):
-
+    # NOTE: Replace the path to your file
     PATHS = {
-        "train": ("/raid1/suchen/dataset/swig/images_512",
-                  "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_trainval_1000.json"),
-        "val": ("/raid1/suchen/dataset/swig/images_512",
-                "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"),
-        "dev": ("/raid1/suchen/dataset/swig/images_512",
-                "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"),
+        "train": (SWIG_ROOT, SWIG_TRAIN_ANNO),
+        "val": (SWIG_ROOT, SWIG_VAL_ANNO),
+        "dev": (SWIG_ROOT, SWIG_DEV_ANNO),
     }
 
     img_folder, ann_file = PATHS[image_set]
     dataset = SWiGHOIDetection(
         img_folder,
         ann_file,
-        transforms=make_transforms(image_set),
-        image_set=image_set
+        transforms=make_transforms(image_set, args),
+        image_set=image_set,
+        repeat_factor_sampling=args.repeat_factor_sampling,
     )
+
     return dataset

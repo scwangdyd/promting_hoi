@@ -10,7 +10,6 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as F
 from utils.box_ops import box_xyxy_to_cxcywh
 from utils.misc import interpolate
-from .augmentation import Augmentation
 
 
 def crop(image, target, region):
@@ -23,6 +22,7 @@ def crop(image, target, region):
     # should we do something wrt the original size?
     target["size"] = torch.tensor([h, w])
 
+    """ deprecated, this part is mainly for ResizeAndCenterCrop (deprecated)
     # Image is padded with 0 if the crop region is out of boundary.
     # We use `image_mask` to indicate the padding regions.
     image_mask = torch.zeros((h, w)).bool()
@@ -31,6 +31,7 @@ def crop(image, target, region):
     image_mask[abs(i) + ori_h :, :]  = True
     image_mask[:, abs(j) + ori_w :]  = True
     target["image_mask"] = image_mask
+    """
 
     fields = ["classes"]
 
@@ -96,7 +97,8 @@ def hflip(image, target):
 
 def resize(image, target, size, max_size=None):
     # size can be min_size (scalar) or (w, h) tuple
-
+    # import pdb;pdb.set_trace()
+    maxs = size
     def get_size_with_aspect_ratio(image_size, size, max_size=None):
         w, h = image_size
         if max_size is not None:
@@ -106,14 +108,26 @@ def resize(image, target, size, max_size=None):
                 size = int(round(max_size * min_original_size / max_original_size))
 
         if (w <= h and w == size) or (h <= w and h == size):
+            w_mod = np.mod(w, 16)
+            h_mod = np.mod(h, 16)
+            h = h - h_mod
+            w = w - w_mod
             return (h, w)
 
         if w < h:
             ow = size
             oh = int(size * h / w)
+            ow_mod = np.mod(ow, 16)
+            oh_mod = np.mod(oh, 16)
+            ow = ow - ow_mod
+            oh = oh - oh_mod
         else:
             oh = size
             ow = int(size * w / h)
+            ow_mod = np.mod(ow, 16)
+            oh_mod = np.mod(oh, 16)
+            ow = ow - ow_mod
+            oh = oh - oh_mod
 
         return (oh, ow)
 
@@ -151,6 +165,7 @@ def resize(image, target, size, max_size=None):
             target['masks'][:, None].float(), size, mode="nearest")[:, 0] > 0.5
 
     return rescaled_image, target
+
 
 
 def pad(image, target, padding):
@@ -264,7 +279,7 @@ class CenterCrop(object):
 class ResizeAndCenterCrop(object):
     def __init__(self, size):
         self.size = size
-        
+
     def __call__(self, img, target):
         img, target = resize_long_edge(img, target, self.size)
         image_width, image_height = img.size
@@ -383,15 +398,15 @@ class RandomCrop_InteractionConstraint(object):
         """
         self.crop_ratio = crop_ratio
         self.p = p
-    
+
     def __call__(self, image, target):
         boxes = target["boxes"]
         w, h = image.size[:2]
         croph, cropw = int(h * self.crop_ratio[0]), int(w * self.crop_ratio[1])
         assert h >= croph and w >= cropw, "Shape computation in {} has bugs.".format(self)
-        h_choice = np.arange(0, h - croph + 1)
-        w_choice = np.arange(0, w - cropw + 1)
-        h_prob, w_prob = np.ones(len(h_choice)), np.ones(len(w_choice))
+        h0_choice = np.arange(0, h - croph + 1)
+        w0_choice = np.arange(0, w - cropw + 1)
+        h_prob, w_prob = np.ones(len(h0_choice)), np.ones(len(w0_choice))
         for box in boxes:
             h_min = min(int(box[1] - croph) + 1, len(h_prob))
             h_max = int(box[3])
@@ -399,13 +414,74 @@ class RandomCrop_InteractionConstraint(object):
             w_max = int(box[2])
             if h_min > 0:
                 h_prob[:h_min] = h_prob[:h_min] * self.p
-            if h_max < h_choice[-1]:
+            if h_max < h0_choice[-1]:
                 h_prob[h_max:] = h_prob[h_max:] * self.p
             if w_min > 0:
                 w_prob[:w_min] = w_prob[:w_min] * self.p
-            if w_max < w_choice[-1]:
+            if w_max < w0_choice[-1]:
                 w_prob[w_max:] = w_prob[w_max:] * self.p
         h_prob, w_prob = h_prob / h_prob.sum(), w_prob / w_prob.sum() 
-        h0 = int(np.random.choice(h_choice, 1, p=h_prob)[0])
-        w0 = int(np.random.choice(w_choice, 1, p=w_prob)[0])
+        h0 = int(np.random.choice(h0_choice, 1, p=h_prob)[0])
+        w0 = int(np.random.choice(w0_choice, 1, p=w_prob)[0])
         return crop(image, target, (h0, w0, croph, cropw))
+
+
+""" deprecated, resize implementation
+def resize(image, target, size, max_size=None):
+    # size can be min_size (scalar) or (w, h) tuple
+
+    def get_size_with_aspect_ratio(image_size, size, max_size=None):
+        w, h = image_size
+        if max_size is not None:
+            min_original_size = float(min((w, h)))
+            max_original_size = float(max((w, h)))
+            if max_original_size / min_original_size * size > max_size:
+                size = int(round(max_size * min_original_size / max_original_size))
+
+        if (w <= h and w == size) or (h <= w and h == size):
+            return (h, w)
+
+        if w < h:
+            ow = size
+            oh = int(size * h / w)
+        else:
+            oh = size
+            ow = int(size * w / h)
+
+        return (oh, ow)
+
+    def get_size(image_size, size, max_size=None):
+        if isinstance(size, (list, tuple)):
+            return size[::-1]
+        else:
+            return get_size_with_aspect_ratio(image_size, size, max_size)
+
+    size = get_size(image.size, size, max_size)
+    rescaled_image = F.resize(image, size)
+
+    if target is None:
+        return rescaled_image, None
+
+    ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_image.size, image.size))
+    ratio_width, ratio_height = ratios
+
+    target = target.copy()
+    if "boxes" in target:
+        boxes = target["boxes"]
+        scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
+        target["boxes"] = scaled_boxes
+
+    if "area" in target:
+        area = target["area"]
+        scaled_area = area * (ratio_width * ratio_height)
+        target["area"] = scaled_area
+
+    h, w = size
+    target["size"] = torch.tensor([h, w])
+
+    if "masks" in target:
+        target['masks'] = interpolate(
+            target['masks'][:, None].float(), size, mode="nearest")[:, 0] > 0.5
+
+    return rescaled_image, target
+"""
