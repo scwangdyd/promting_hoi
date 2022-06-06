@@ -31,16 +31,18 @@ class Bottleneck(nn.Module):
         # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
         self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
+        self.relu1 = nn.ReLU(inplace=True)
 
         self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
+        self.relu2 = nn.ReLU(inplace=True)
 
         self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
 
         self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu3 = nn.ReLU(inplace=True)
 
-        self.relu = nn.ReLU(inplace=True)
         self.downsample = None
         self.stride = stride
 
@@ -55,8 +57,8 @@ class Bottleneck(nn.Module):
     def forward(self, x: torch.Tensor):
         identity = x
 
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.relu1(self.bn1(self.conv1(x)))
+        out = self.relu2(self.bn2(self.conv2(out)))
         out = self.avgpool(out)
         out = self.bn3(self.conv3(out))
 
@@ -64,7 +66,7 @@ class Bottleneck(nn.Module):
             identity = self.downsample(x)
 
         out += identity
-        out = self.relu(out)
+        out = self.relu3(out)
         return out
 
 
@@ -121,12 +123,14 @@ class ModifiedResNet(nn.Module):
         # the 3-layer stem
         self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(width // 2)
+        self.relu1 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(width // 2)
+        self.relu2 = nn.ReLU(inplace=True)
         self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(width)
+        self.relu3 = nn.ReLU(inplace=True)
         self.avgpool = nn.AvgPool2d(2)
-        self.relu = nn.ReLU(inplace=True)
 
         # residual layers
         self._inplanes = width  # this is a *mutable* variable used during construction
@@ -149,8 +153,9 @@ class ModifiedResNet(nn.Module):
 
     def forward(self, x):
         def stem(x):
-            for conv, bn in [(self.conv1, self.bn1), (self.conv2, self.bn2), (self.conv3, self.bn3)]:
-                x = self.relu(bn(conv(x)))
+            x = self.relu1(self.bn1(self.conv1(x)))
+            x = self.relu2(self.bn2(self.conv2(x)))
+            x = self.relu3(self.bn3(self.conv3(x)))
             x = self.avgpool(x)
             return x
 
@@ -213,149 +218,6 @@ class Transformer(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
-
-class HOIResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
-        super().__init__()
-        
-        self.hoi_attn = nn.MultiheadAttention(d_model, n_head, dropout=0.1)
-        self.hoi_cross_attn = nn.MultiheadAttention(d_model, n_head, dropout=0.1)
-        self.attn = nn.MultiheadAttention(d_model, n_head)
-        
-        self.ln_1 = LayerNorm(d_model)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
-        ]))
-        self.ln_2 = LayerNorm(d_model)
-        self.attn_mask = attn_mask
-        
-        self.hoi_ln1 = LayerNorm(d_model)
-        self.hoi_ln2 = LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(0.1)
-        self.dropout2 = nn.Dropout(0.1)
-        self.dropout3 = nn.Dropout(0.1)
-
-    def attention(self, x: torch.Tensor, mask: torch.Tensor = None):
-        return self.attn(x, x, x, need_weights=False, key_padding_mask=mask)[0]
-
-    def hoi_attention(self, y: torch.Tensor, attn_mask: torch.Tensor = None):
-        self.attn_mask = self.attn_mask.to(dtype=y.dtype, device=y.device) if self.attn_mask is not None else None
-        y, attn_map = self.hoi_attn(y, y, y, attn_mask=self.attn_mask)
-        return y
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None):
-        
-        y2, attn_map = self.hoi_cross_attn(self.hoi_ln2(y), self.ln_1(x), self.ln_1(x), key_padding_mask=mask)
-        y = y + self.dropout2(y2)
-        y = y + self.dropout3(self.mlp(self.ln_2(y)))
-
-        x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        
-        # Cross self-attn
-        y = torch.cat([x[0:1], y], dim=0)
-        y = y + self.dropout1(self.hoi_attention(self.hoi_ln1(y)))
-        y = y[1:]
-
-        return x, y, attn_map
-
-
-class HOITransformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor=None):
-        super().__init__()
-        self.width = width
-        self.layers = layers
-        self.resblocks = nn.Sequential(*[HOIResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None):
-        for resblock in self.resblocks:
-            x, y, attn_map = resblock(x, y, mask)
-        return x, y, attn_map
-
-
-class HOIVisionTransformer(nn.Module):
-    def __init__(
-        self,
-        input_resolution: int,
-        patch_size: int,
-        width: int,
-        layers: int,
-        heads: int,
-        output_dim: int,
-        hoi_token_length: int = 5,
-        attn_mask: torch.Tensor = None,
-    ):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.hoi_token_length = hoi_token_length
-        self.output_dim = output_dim
-        self.patch_size = patch_size
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
-
-        scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-        self.ln_pre = LayerNorm(width)
-
-        self.transformer = HOITransformer(width, layers, heads, attn_mask)
-
-        self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
-        
-        self.hoi_embedding = nn.Parameter(scale * torch.randn(hoi_token_length, width))
-        self.hoi_positional_embedding = nn.Parameter(scale * torch.randn(hoi_token_length, width))
-
-        self.hoi_bbox = nn.Linear(width, output_dim)
-        self.hoi_conf = nn.Linear(width, output_dim)
-
-        self.initialize_parameters()
-
-    def initialize_parameters(self):
-        nn.init.normal_(self.hoi_bbox.weight, std=0.01)
-        nn.init.normal_(self.hoi_conf.weight, std=0.01)
-        self.hoi_bbox.bias.data.fill_(0.01)
-        self.hoi_conf.bias.data.fill_(0.01)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        if mask is not None:
-            mask = F.avg_pool2d(mask.float(), kernel_size=self.patch_size)
-            mask[mask < 1.] = 0.
-            mask = mask.bool()
-            mask = mask.reshape(mask.shape[0], -1) # shape = [*, grid ** 2]
-            mask = torch.cat([torch.ones((mask.shape[0], 1), dtype=mask.dtype, device=mask.device), mask], dim=-1)
-
-        # Concatenate [CLS]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        # [HOI]_1, [HOI]_2, ..., [HOI]_n
-        y = self.hoi_embedding.to(x.dtype) + torch.zeros(x.shape[0], self.hoi_token_length, x.shape[-1], dtype=x.dtype, device=x.device)
-        
-        x = x + self.positional_embedding.to(x.dtype)
-        y = y + self.hoi_positional_embedding.to(x.dtype)
-
-        x = self.ln_pre(x)
-        y = self.ln_pre(y)
-        
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        y = y.permute(1, 0, 2)  # NLD -> LND
-        x, y, attn_map = self.transformer(x, y, mask)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        y = y.permute(1, 0, 2)  # LND -> NLD
-
-        x_cls = self.ln_post(x[:, 0, :])
-        y = self.ln_post(y)
-
-        x_cls = x_cls @ self.proj
-        y_cls = y @ self.proj
-
-        y_bbox = self.hoi_bbox(y)
-        y_conf = self.hoi_conf(y)
-
-        return x_cls, y_cls, y_bbox, y_conf, attn_map
 
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
@@ -514,8 +376,8 @@ class CLIP(nn.Module):
         text_features = self.encode_text(text)
 
         # normalized features
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
@@ -541,19 +403,11 @@ def convert_weights(model: nn.Module):
                 if tensor is not None:
                     tensor.data = tensor.data.half()
 
-        for name in ["text_projection", "proj", "hoi_prefix", "hoi_conjun"]:
+        for name in ["text_projection", "proj"]:
             if hasattr(l, name):
                 attr = getattr(l, name)
                 if attr is not None:
                     attr.data = attr.data.half()
-
-        for name in ["bbox_embed"]:
-            if hasattr(l, name):
-                attr = getattr(l, name)
-                if attr is not None:
-                    for x in attr.layers:
-                        x.weight = x.weight.half()
-                        x.bias = x.bias.half()
 
     model.apply(_convert_weights_to_fp16)
 
@@ -594,6 +448,5 @@ def build_model(state_dict: dict):
             del state_dict[key]
 
     convert_weights(model)
-    # model.load_state_dict(state_dict)
-    model.load_state_dict(state_dict, strict=False)
-    return model
+    model.load_state_dict(state_dict)
+    return model.eval()
