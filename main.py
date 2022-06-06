@@ -1,3 +1,6 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Modified by Suchen for HOI detection
+
 import argparse
 import datetime
 import json
@@ -11,98 +14,18 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import utils.misc as utils
 from datasets import build_dataset
-from engine import train_one_epoch, evaluate
+from engine import train_one_epoch, evaluate, get_flop_stats
 from models import build_model
-
-def get_args_parser():
-    parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_backbone', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=8, type=int)
-    parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--lr_drop', default=200, type=int)
-    parser.add_argument('--clip_max_norm', default=0.1, type=float,
-                        help='gradient clipping max norm')
-
-    # Model parameters
-    parser.add_argument('--clip_model', default="ViT-B/16", type=str,
-                        help="Name of pretrained CLIP model")
-    parser.add_argument('--frozen_weights', type=str, default=None,
-                        help="Path to the pretrained model. If set, only the mask head will be trained")
-    # * Vision
-    parser.add_argument('--embed_dim', default=512, type=int,
-                        help="Size of the embeddings (dimension of the transformer)")
-    parser.add_argument('--image_resolution', default=224, type=int,
-                        help="input image resolution to the vision transformer")
-    parser.add_argument('--vision_layers', default=12, type=int,
-                        help="number of layers in vision transformer")
-    parser.add_argument('--vision_width', default=768, type=int,
-                        help="feature channels in vision transformer")
-    parser.add_argument('--vision_patch_size', default=16, type=int,
-                        help="patch size: the input image is divided into multiple patches")
-    parser.add_argument('--hoi_token_length', default=5, type=int,
-                        help="Number of learnable hoi tokens added to transformer's input")
-    # * Text
-    parser.add_argument('--context_length', default=77, type=int,
-                        help="Maximum length of the text description")
-    parser.add_argument('--vocab_size', default=49408, type=int,
-                        help="")
-    parser.add_argument('--transformer_width', default=512, type=int,
-                        help="")
-    parser.add_argument('--transformer_heads', default=8, type=int,
-                        help="")
-    parser.add_argument('--transformer_layers', default=12, type=int,
-                        help="")
-    parser.add_argument('--prefix_length', default=8, type=int,
-                        help="Length the of the learnable prefix in the sentence")
-    parser.add_argument('--conjun_length', default=2, type=int,
-                        help="Length of the conjunction words between actions and objects")
-    # Loss
-    parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
-                        help="Disables auxiliary decoding losses (loss at each layer)")
-    # * Matcher
-    parser.add_argument('--set_cost_class', default=1, type=float,
-                        help="Class coefficient in the matching cost")
-    parser.add_argument('--set_cost_bbox', default=5, type=float,
-                        help="L1 box coefficient in the matching cost")
-    parser.add_argument('--set_cost_giou', default=2, type=float,
-                        help="giou box coefficient in the matching cost")
-    # * Loss coefficients
-    parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--eos_coef', default=0.1, type=float,
-                        help="Relative classification weight of the no-object class")
-    parser.add_argument('--test_score_thresh', default=0.001, type=float,
-                        help="threshold to filter out HOI predictions")
-    # dataset parameters
-    parser.add_argument('--dataset_file', default='swig')
-    parser.add_argument('--output_dir', default='',
-                        help='path where to save, empty for no saving')
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
-    parser.add_argument('--seed', default=36, type=int)
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
-    parser.add_argument('--pretrained', default='', help='resume from checkpoint')
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                        help='start epoch')
-    parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--num_workers', default=2, type=int)
-
-    # distributed training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--local_rank', help='url used to set up distributed training')
-    return parser
+from arguments import get_args_parser
+from utils.scheduler import create_scheduler
 
 
 def main(args):
+    """Training and evaluation function"""
+
+    # distributed data parallel setup
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
-
-    if args.frozen_weights is not None:
-        assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
 
     device = torch.device(args.device)
@@ -120,34 +43,34 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print('number of params:', n_parameters)
 
-    # Frozen CLIP model
-    update_modules = [n for n, p in model_without_ddp.named_parameters() if "hoi" in n or "bbox" in n]
-    frozen_modules = [n for n, p in model_without_ddp.named_parameters() if n not in update_modules]
-    
-    for n, p in model_without_ddp.named_parameters():
-        if n in frozen_modules:
-            p.requires_grad = False
-    
-    param_dicts = [
-        {
-            "params": [p for n, p in model_without_ddp.named_parameters() if n in update_modules and p.requires_grad],
-            "lr": args.lr
-        },
-        # {
-        #     "params": [p for n, p in model_without_ddp.named_parameters() if n in frozen_modules and p.requires_grad],
-        #     "lr": 0.,
-        # },
-    ]
+    # optimizer setup
+    def build_optimizer(model):
+        # * frozen CLIP model
+        update_modules, update_params = [], []
+        frozen_modules, frozen_params = [], []
+        for n, p in model.named_parameters():
+            if 'hoi' in n or 'bbox' in n:
+                update_modules.append(n)
+                update_params.append(p)
+            else:
+                frozen_modules.append(n)
+                frozen_params.append(p)
+                p.requires_grad = False
 
-    # optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model_without_ddp.parameters()), lr=args.lr, weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                                      lr=args.lr, weight_decay=args.weight_decay)
+        return optimizer
+
+    optimizer = build_optimizer(model_without_ddp)
+    lr_scheduler, _ = create_scheduler(args, optimizer)
+
+    n_parameters = sum(p.numel() for p in model_without_ddp.parameters() if p.requires_grad)
+    print('number of trainable params:', n_parameters, f'{n_parameters/1e6:.3f}M')
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
+    print('# train:', len(dataset_train), ', # val', len(dataset_val))
 
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
@@ -164,11 +87,9 @@ def main(args):
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
 
-    if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location='cpu')
-        model_without_ddp.detr.load_state_dict(checkpoint['model'])
-
     output_dir = Path(args.output_dir)
+
+    # resume from the given checkpoint
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -182,8 +103,13 @@ def main(args):
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
 
+    # evaluation
     if args.eval:
-        test_stats, evaluator = evaluate(model, criterion, data_loader_val, device, args)
+        # print FLOPs
+        # get_flop_stats(model, data_loader_val)
+        test_stats, evaluator = evaluate(model, postprocessors, criterion, data_loader_val, device, args)
+        if args.output_dir:
+            evaluator.save(args.output_dir)
         return
 
     print("Start training")
@@ -191,10 +117,11 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
-        lr_scheduler.step()
+        train_stats = train_one_epoch(model, criterion, data_loader_train, optimizer,
+                                      device, epoch, args.clip_max_norm)
+        lr_scheduler.step(epoch)
+
+        # checkpoint saving
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every 100 epochs

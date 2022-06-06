@@ -1,56 +1,19 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Modified by Suchen for HOI detection
 """
 Train and eval functions used in main.py
 """
 import math
 import sys
 from typing import Iterable
-
 import torch
-
 import utils.misc as utils
-import utils.box_ops as box_ops
-
-from clip import clip
-from clip.model import convert_weights
-from utils.swig_evaluator import SWiGEvaluator
-from utils.hico_evaluator import HICOEvaluator
-from utils.visualize import visualize_preds
-from cascade_hoist.layers import batched_nms
-import torch.nn.functional as F
+from models.model import convert_weights
+from datasets import build_evaluator
+from utils.visualizer import Visualizer
+from fvcore.nn import FlopCountAnalysis, flop_count_table
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
-
-
-def prepare_inputs(images, targets, device):
-    """Prepare model inputs."""
-    images = images.to(device)
-    targets = [{k: v.to(device) if k != "hois" else v for k, v in t.items()} for t in targets]
-
-    sot_token = _tokenizer.encoder["<|startoftext|>"]
-    eot_token = _tokenizer.encoder["<|endoftext|>"]
-
-    texts = []
-    text_inputs = []
-    unique_hois = set()
-    for t in targets:
-        for hoi in t["hois"]:
-            # Ensure all texts are unique (no duplicates).
-            hoi_id = hoi["hoi_id"]
-            if hoi_id in unique_hois:
-                continue
-            else:
-                unique_hois.add(hoi_id)
-            action_text, object_text = hoi["text"]
-            action_token = _tokenizer.encode(action_text)
-            object_token = _tokenizer.encode(object_text)
-            
-            action_token = torch.as_tensor([sot_token] + action_token, dtype=torch.long).to(device)
-            object_token = torch.as_tensor(object_token + [eot_token], dtype=torch.long).to(device)
-            texts.append([action_token, object_token])
-            text_inputs.append(action_text + " " + object_text)
-    
-    return images, targets, texts
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -64,22 +27,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
-    for images, targets in metric_logger.log_every(data_loader, print_freq, header): 
-               
-        images, targets, texts = prepare_inputs(images, targets, device)
+    for images, targets in metric_logger.log_every(data_loader, print_freq, header):
+
+        images, targets, texts = prepare_inputs(images, targets, data_loader, device)
         outputs = model(images.tensors, texts, images.mask)
         loss_dict, indices = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
-        # visualize_preds(images, targets, outputs, indices)
-
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
-        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-                                      for k, v in loss_dict_reduced.items()}
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items()}
+        loss_dict_reduced_scaled = {k: v * weight_dict[k] for k, v in loss_dict_reduced.items() if k in weight_dict}
         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
 
         loss_value = losses_reduced_scaled.item()
@@ -105,7 +64,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, data_loader, device, args):
+def evaluate(model, postprocessors, criterion, data_loader, device, args):
     model.eval()
     criterion.eval()
 
@@ -113,60 +72,55 @@ def evaluate(model, criterion, data_loader, device, args):
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Test:'
 
+    # Convert applicable model parameters to fp16
     convert_weights(model)
 
-    if args.dataset_file == "swig":
-        anno_file = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"
-        evaluator = SWiGEvaluator(anno_file, args.output_dir)
-    if args.dataset_file == "hico":
-        anno_file = "/raid1/suchen/repo/promting_hoi/data/HICO-DET/test_hico_ann.json"
-        evaluator = HICOEvaluator(anno_file, args.output_dir)
-    else:
-        raise NotImplementedError
+    # Build evaluator
+    evaluator = build_evaluator(args)
 
+    # Convert all interaction categories into embeddings
     text_features = prepare_text_inputs(model, data_loader.dataset.dataset_texts, device)
-    
+
+    # Inference
     for images, targets in metric_logger.log_every(data_loader, 10, header):
         images = images.to(device)
         targets = [{k: v.to(device) if k != "hois" else v for k, v in t.items()} for t in targets]
 
-        _, hoi_features, box_features, conf_features, attn_maps = model.encode_image(images.tensors, images.mask)
+        vision_outputs = model.encode_image(images.tensors, images.mask)
 
+        hoi_features = vision_outputs['hoi_features']
         hoi_features = hoi_features / hoi_features.norm(dim=-1, keepdim=True)
-        pred_boxes = model.bbox_embed(box_features).sigmoid().float()
-        conf_scores = model.hoi_confidence_embed(F.relu(conf_features))
         logits_per_hoi = model.logit_scale.exp() * hoi_features @ text_features.t()
-        
-        outputs = {"logits_per_hoi": logits_per_hoi, "pred_boxes": pred_boxes, "confidence_scores": conf_scores, "attention_maps": attn_maps}
-        
+        pred_boxes = vision_outputs["pred_boxes"]
+        box_scores = vision_outputs["box_scores"]
+
+        outputs = {"logits_per_hoi": logits_per_hoi,
+                   "pred_boxes": pred_boxes,
+                   "box_scores": box_scores,
+                   "aux_outputs": vision_outputs["aux_outputs"],
+                   "attn_maps": vision_outputs['attn_maps']}
+
         loss_dict, indices = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
-        # visualize_preds(images, targets, outputs, indices)
+        if args.vis_outputs:
+            visualizer = Visualizer(args)
+            visualizer.visualize_preds(images, targets, outputs)
+            visualizer.visualize_attention(images, targets, outputs)
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
-        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-                                      for k, v in loss_dict_reduced.items()}
-        metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()),
-                             **loss_dict_reduced_scaled,
-                             **loss_dict_reduced_unscaled)
+        loss_dict_reduced_scaled = {k: v * weight_dict[k] for k, v in loss_dict_reduced.items() if k in weight_dict}
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items()}
+        metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()), **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
 
-        results = {int(targets[i]["image_id"]):
-            postprocessing(
-                logits_per_hoi[i],
-                conf_scores[i],
-                pred_boxes[i],
-                images.mask[i],
-                targets[i]["orig_size"],
-                data_loader.dataset.text_mapper,
-                args.test_score_thresh,
-            ) for i in range(len(images.mask))
-        }
-        
+        results = {int(targets[i]['image_id']): postprocessors(
+            {'pred_logits': logits_per_hoi[i], 'pred_boxes': pred_boxes[i], 'box_scores': box_scores[i]},
+            targets[i]['orig_size'],
+            data_loader.dataset.text_mapper
+        ) for i in range(len(images.tensors))}
+
         evaluator.update(results)
 
     # gather the stats from all processes
@@ -177,21 +131,111 @@ def evaluate(model, criterion, data_loader, device, args):
     # accumulate predictions from all images
     evaluator.accumulate()
     evaluator.summarize()
-    evaluator.save()
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     return stats, evaluator
+
+
+def prepare_inputs(images, targets, data_loader, device):
+    """Prepare model inputs."""
+    # image inputs
+    images = images.to(device)
+    targets = [{k: v.to(device) if k != "hois" else v for k, v in t.items()} for t in targets]
+
+    # text inputs
+    sot_token = _tokenizer.encoder["<|startoftext|>"]
+    eot_token = _tokenizer.encoder["<|endoftext|>"]
+
+    texts = []
+    text_inputs = []
+    unique_hois = set()
+
+    for t in targets:
+        for hoi in t["hois"]:
+            # Ensure all texts are unique (no duplicates).
+            hoi_id = hoi["hoi_id"]
+            if hoi_id in unique_hois:
+                continue
+            else:
+                unique_hois.add(hoi_id)
+            action_text, object_text = hoi["text"]
+            action_token = _tokenizer.encode(action_text.replace("_", " "))
+            object_token = _tokenizer.encode(object_text.replace("_", " "))
+
+            action_token = torch.as_tensor([sot_token] + action_token, dtype=torch.long).to(device)
+            object_token = torch.as_tensor(object_token + [eot_token], dtype=torch.long).to(device)
+            texts.append([action_token, object_token])
+            text_inputs.append(action_text + " " + object_text)
+
+    # [specific for HICO-DET], load related hois based on the targets in mini-batch
+    if hasattr(data_loader.dataset, 'object_to_related_hois') and hasattr(data_loader.dataset, 'action_to_related_hois'):
+        object_to_related_hois = data_loader.dataset.object_to_related_hois
+        action_to_related_hois = data_loader.dataset.action_to_related_hois
+
+        related_texts = []
+        related_text_inputs = []
+        unique_actions = set()
+        unique_objects = set()
+        unique_related_hois = set()
+        for t in targets:
+            for hoi in t["hois"]:
+                hoi_id = hoi["hoi_id"]
+                query_action_text, query_object_text = hoi["text"]
+                if query_action_text in unique_actions or query_object_text in unique_objects:
+                    continue
+                else:
+                    unique_actions.add(query_action_text)
+                    unique_objects.add(query_object_text)
+
+                related_hois = action_to_related_hois[query_action_text]
+                for hoi in related_hois:
+                    hoi_id = hoi["hoi_id"]
+                    if hoi_id in unique_hois:
+                        continue
+                    if hoi_id in unique_related_hois:
+                        continue
+                    else:
+                        unique_related_hois.add(hoi_id)
+
+                    action_text, object_text = hoi["text"]
+                    action_token = _tokenizer.encode(action_text.replace("_", " "))
+                    object_token = _tokenizer.encode(object_text.replace("_", " "))
+                    action_token = torch.as_tensor([sot_token] + action_token, dtype=torch.long).to(device)
+                    object_token = torch.as_tensor(object_token + [eot_token], dtype=torch.long).to(device)
+                    related_texts.append([action_token, object_token])
+                    related_text_inputs.append(action_text + " " + object_text)
+
+                related_hois = object_to_related_hois[query_object_text]
+                for hoi in related_hois:
+                    hoi_id = hoi["hoi_id"]
+                    if hoi_id in unique_hois:
+                        continue
+                    if hoi_id in unique_related_hois:
+                        continue
+                    else:
+                        unique_related_hois.add(hoi_id)
+
+                    action_text, object_text = hoi["text"]
+                    action_token = _tokenizer.encode(action_text.replace("_", " "))
+                    object_token = _tokenizer.encode(object_text.replace("_", " "))
+                    action_token = torch.as_tensor([sot_token] + action_token, dtype=torch.long).to(device)
+                    object_token = torch.as_tensor(object_token + [eot_token], dtype=torch.long).to(device)
+                    related_texts.append([action_token, object_token])
+                    related_text_inputs.append(action_text + " " + object_text)
+        texts.extend(related_texts)
+
+    return images, targets, texts
 
 
 @torch.no_grad()
 def prepare_text_inputs(model, texts, device):
     sot_token = _tokenizer.encoder["<|startoftext|>"]
     eot_token = _tokenizer.encoder["<|endoftext|>"]
-    
+
     text_tokens = []
     for action_text, object_text in texts:
-        action_token = _tokenizer.encode(action_text)
-        object_token = _tokenizer.encode(object_text)
-        
+        action_token = _tokenizer.encode(action_text.replace("_", " "))
+        object_token = _tokenizer.encode(object_text.replace("_", " "))
+
         action_token = torch.as_tensor([sot_token] + action_token, dtype=torch.long).to(device)
         object_token = torch.as_tensor(object_token + [eot_token], dtype=torch.long).to(device)
         text_tokens.append([action_token, object_token])
@@ -201,75 +245,61 @@ def prepare_text_inputs(model, texts, device):
     return text_features
 
 
-def postprocessing(hoi_scores, conf_scores, pred_boxes, img_mask, orig_size, indices_mapper, test_thresh=0.001):
-    hoi_scores = hoi_scores.softmax(dim=-1)
-    conf_scores = conf_scores.sigmoid()
-    scores = hoi_scores * conf_scores
-    
-    keep = torch.nonzero(scores > test_thresh, as_tuple=True)
-    
-    pred_person_boxes, pred_object_boxes = postprocessing_boxes(pred_boxes, img_mask, orig_size)
-
-    # Apply nms
-    scores = scores[keep]
-    classes = keep[1]
-    pred_person_boxes = pred_person_boxes[keep[0]]
-    pred_object_boxes = pred_object_boxes[keep[0]]
-    
-    person_keep = batched_nms(pred_person_boxes, scores, classes, 0.5)
-    object_keep = batched_nms(pred_object_boxes, scores, classes, 0.5)
-    
-    person_filter_mask = torch.zeros_like(scores, dtype=torch.bool)
-    object_filter_mask = torch.zeros_like(scores, dtype=torch.bool)
-    person_filter_mask[person_keep] = True
-    object_filter_mask[object_keep] = True
-    filter_mask = torch.logical_or(person_filter_mask, object_filter_mask)
-    
-    scores = scores[filter_mask].detach().cpu().numpy().tolist()
-    classes = classes[filter_mask].detach().cpu().numpy().tolist()
-    pred_boxes = torch.cat([pred_person_boxes, pred_object_boxes], dim=-1)
-    pred_boxes = pred_boxes[filter_mask].detach().cpu().numpy().tolist()
-    
-    results = []
-    for score, hoi_id, boxes in zip(scores, classes, pred_boxes):
-        results.append([indices_mapper[int(hoi_id)], score] + boxes)
-
-    return results
+def get_flop_stats(model, data_loader):
+    """
+    Compute the gflops for the current model given the config.
+    Args:
+        model (model): model to compute the flop counts.
+        cfg (CfgNode): configs. Details can be found in
+            slowfast/config/defaults.py
+        is_train (bool): if True, compute flops for training. Otherwise,
+            compute flops for testing.
+    Returns:
+        float: the total number of gflops of the given model.
+    """
+    inputs = _get_model_analysis_input(data_loader)
+    flops = FlopCountAnalysis(model, inputs)
+    print("Total FLOPs(G)", flops.total() / 1e9)
+    print(flop_count_table(flops, max_depth=4, show_param_shapes=False))
+    return flops
 
 
-def postprocessing_boxes(pred_boxes, img_mask, orig_size):
-    # Map the pred boxes to the original image size
-    pred_person_boxes = box_ops.box_cxcywh_to_xyxy(pred_boxes[:, :4])
-    pred_object_boxes = box_ops.box_cxcywh_to_xyxy(pred_boxes[:, 4:])
-    
-    pred_person_boxes = pred_person_boxes.clamp(min=0, max=1)
-    pred_object_boxes = pred_object_boxes.clamp(min=0, max=1)
-    
-    h, w = img_mask.shape
-    pred_person_boxes[:, 0::2] = pred_person_boxes[:, 0::2] * w
-    pred_person_boxes[:, 1::2] = pred_person_boxes[:, 1::2] * h
-    pred_object_boxes[:, 0::2] = pred_object_boxes[:, 0::2] * w
-    pred_object_boxes[:, 1::2] = pred_object_boxes[:, 1::2] * h
-    
-    img_mask = ~img_mask
-    valid_min_x = int(torch.nonzero(img_mask, as_tuple=True)[1].min())
-    valid_min_y = int(torch.nonzero(img_mask, as_tuple=True)[0].min())
-    
-    pred_person_boxes[:, 0::2] -= valid_min_x
-    pred_person_boxes[:, 1::2] -= valid_min_y
-    pred_object_boxes[:, 0::2] -= valid_min_x
-    pred_object_boxes[:, 1::2] -= valid_min_y
+def _get_model_analysis_input(data_loader):
+    for images, targets in data_loader:
+        images, targets, texts = prepare_inputs(images, targets, "cuda")
+        inputs = (images.tensors, texts, images.mask)
+        return inputs
 
-    pred_person_boxes[:, 0::2] = pred_person_boxes[:, 0::2].clamp(min=0, max=w-2*valid_min_x)
-    pred_person_boxes[:, 1::2] = pred_person_boxes[:, 1::2].clamp(min=0, max=h-2*valid_min_y)
-    pred_object_boxes[:, 0::2] = pred_object_boxes[:, 0::2].clamp(min=0, max=w-2*valid_min_x)
-    pred_object_boxes[:, 1::2] = pred_object_boxes[:, 1::2].clamp(min=0, max=h-2*valid_min_y)
 
-    ori_h, ori_w = orig_size
-    scale_x, scale_y = ori_w / w, ori_h / h
-    ratio = max(scale_x, scale_y)
-    pred_person_boxes[:, 0::2] *= ratio
-    pred_person_boxes[:, 1::2] *= ratio
-    pred_object_boxes[:, 0::2] *= ratio
-    pred_object_boxes[:, 1::2] *= ratio
-    return pred_person_boxes, pred_object_boxes
+''' deprecated, text
+def prepare_inputs(images, targets, device):
+    """Prepare model inputs."""
+    images = images.to(device)
+    targets = [{k: v.to(device) if k != "hois" else v for k, v in t.items()} for t in targets]
+
+    sot_token = _tokenizer.encoder["<|startoftext|>"]
+    eot_token = _tokenizer.encoder["<|endoftext|>"]
+
+    texts = []
+    text_inputs = []
+    unique_hois = set()
+
+    for t in targets:
+        for hoi in t["hois"]:
+            # Ensure all texts are unique (no duplicates).
+            hoi_id = hoi["hoi_id"]
+            if hoi_id in unique_hois:
+                continue
+            else:
+                unique_hois.add(hoi_id)
+            action_text, object_text = hoi["text"]
+            action_token = _tokenizer.encode(action_text.replace("_", " "))
+            object_token = _tokenizer.encode(object_text.replace("_", " "))
+
+            action_token = torch.as_tensor([sot_token] + action_token, dtype=torch.long).to(device)
+            object_token = torch.as_tensor(object_token + [eot_token], dtype=torch.long).to(device)
+            texts.append([action_token, object_token])
+            text_inputs.append(action_text + " " + object_text)
+
+    return images, targets, texts
+'''
