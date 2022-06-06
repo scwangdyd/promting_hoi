@@ -1,0 +1,15 @@
+# compilation and distribution
+.vscode/
+__pycache__/
+_ext
+*.py[cod]
+*.pyc
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg/
+
+# outputs
+logs/
