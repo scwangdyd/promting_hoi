@@ -1,3 +1,5 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Modified by Suchen for HOI detection
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -31,37 +33,15 @@ class SetCriterion(nn.Module):
         """
         assert 'logits_per_hoi' in outputs
         src_logits = outputs['logits_per_hoi']
-
-        if self.training:
-            unique_hois, cnt = {}, 0 # Get unique hoi ids in the mini-batch
-            for t in targets:
-                for hoi in t["hois"]:
-                    hoi_id = hoi["hoi_id"]
-                    if hoi_id not in unique_hois:
-                        unique_hois[hoi_id] = cnt
-                        cnt += 1
-            target_classes_i = []
-            for t, (_, indices_per_t) in zip(targets, indices):
-                for i in indices_per_t:
-                    hoi_id = t["hois"][i]["hoi_id"]
-                    target_classes_i.append(unique_hois[hoi_id])
-            target_classes_i = torch.as_tensor(target_classes_i).to(src_logits.device)
-        else:
-            target_classes_i = []
-            for t, (_, indices_per_t) in zip(targets, indices):
-                for i in indices_per_t:
-                    target_classes_i.append(t["hois"][int(i)]["hoi_id"])
-            target_classes_i = torch.as_tensor(target_classes_i).to(src_logits.device)
+        target_classes_i, target_classes_t = self._get_tgt_labels(targets, indices, src_logits.device)
 
         idx = self._get_src_permutation_idx(indices)
+        # image-to-text alignment loss
         loss_i = F.cross_entropy(src_logits[idx], target_classes_i)
-
+        # text-to-image alignment loss
         if self.training:
-            target_classes_t = torch.zeros((len(idx[0]), len(unique_hois)), dtype=torch.int64).to(src_logits.device)
-            for i, cls_id in zip(range(len(target_classes_i)), target_classes_i):
-                target_classes_t[i, cls_id] = 1
-            
-            loss_t = self.masked_out_cross_entropy(src_logits[idx].t(), target_classes_t.t())
+            num_tgts = target_classes_t.shape[1]
+            loss_t = self.masked_out_cross_entropy(src_logits[idx][:, :num_tgts].t(), target_classes_t.t())
             losses = {"loss_ce": (loss_i + loss_t) / 2}
         else:
             losses = {'loss_ce': loss_i}
@@ -78,7 +58,7 @@ class SetCriterion(nn.Module):
         indices = torch.nonzero(num_pos < 2, as_tuple=True)[0]
         targets_one_pos = torch.argmax(target_classes[indices], dim=-1)
         loss += F.cross_entropy(src_logits[indices], targets_one_pos, reduction="sum")
-        
+
         # If there are multiple positive labels, then we compute them one by one. Each time,
         # the other positive labels are masked out.
         indices = torch.nonzero(num_pos > 1, as_tuple=True)[0]
@@ -96,19 +76,20 @@ class SetCriterion(nn.Module):
         return loss
 
     def loss_confidences(self, outputs, targets, indices, num_boxes, log=True):
-        """Confidence score for the interaction prediction.
-        """
-        assert 'confidence_scores' in outputs
-        confidence_scores = outputs['confidence_scores']
+        """ Bounding box confidence score for the interaction prediction. """
+        assert 'box_scores' in outputs
+        box_scores = outputs['box_scores'].sigmoid()
 
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([torch.ones(len(J), dtype=torch.int64, device=confidence_scores.device) for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(confidence_scores.shape[:2], 0, dtype=torch.int64, device=confidence_scores.device)
+        target_classes_o = torch.cat([torch.ones(len(J), dtype=torch.int64, device=box_scores.device) for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(box_scores.shape[:2], 0, dtype=torch.int64, device=box_scores.device)
         target_classes[idx] = target_classes_o
+        target_classes = target_classes.to(box_scores.dtype)
 
-        target_classes = target_classes.to(confidence_scores.dtype)
-        loss_confi = F.binary_cross_entropy(confidence_scores.view(-1).sigmoid(), target_classes.view(-1))
-        losses = {'loss_confi': loss_confi}
+        weight = torch.ones_like(target_classes) * self.eos_coef
+        weight[idx] = 1.
+        loss_conf = F.binary_cross_entropy(box_scores.flatten(), target_classes.flatten(), weight=weight.flatten())
+        losses = {'loss_conf': loss_conf}
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes, log=False):
@@ -119,7 +100,6 @@ class SetCriterion(nn.Module):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
-        # target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         target_boxes = []
         for t, (_, indices_per_t) in zip(targets, indices):
             for i in indices_per_t:
@@ -127,7 +107,7 @@ class SetCriterion(nn.Module):
                 object_id = t["hois"][i]["object_id"]
                 target_boxes.append(torch.cat([t["boxes"][person_id], t["boxes"][object_id]]))
         target_boxes = torch.stack(target_boxes, dim=0)
-        
+
         loss_pbbox = F.l1_loss(src_boxes[:, :4], target_boxes[:, :4], reduction='none')
         loss_obbox = F.l1_loss(src_boxes[:, 4:], target_boxes[:, 4:], reduction='none')
 
@@ -155,6 +135,35 @@ class SetCriterion(nn.Module):
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
+
+    def _get_tgt_labels(self, targets, indices, device):
+        if self.training:
+            unique_hois, cnt = {}, 0 # Get unique hoi ids in the mini-batch
+            for t in targets:
+                for hoi in t["hois"]:
+                    hoi_id = hoi["hoi_id"]
+                    if hoi_id not in unique_hois:
+                        unique_hois[hoi_id] = cnt
+                        cnt += 1
+            target_classes_i = []
+            for t, (_, indices_per_t) in zip(targets, indices):
+                for i in indices_per_t:
+                    hoi_id = t["hois"][i]["hoi_id"]
+                    target_classes_i.append(unique_hois[hoi_id])
+
+            num_fgs = len(torch.cat([src for (src, _) in indices]))
+            target_classes_t = torch.zeros((num_fgs, cnt), dtype=torch.int64)
+            for i, cls_id in zip(range(len(target_classes_i)), target_classes_i):
+                target_classes_t[i, cls_id] = 1
+            target_classes_t = target_classes_t.to(device)
+        else:
+            target_classes_i = []
+            for t, (_, indices_per_t) in zip(targets, indices):
+                for i in indices_per_t:
+                    target_classes_i.append(t["hois"][int(i)]["hoi_id"])
+            target_classes_t = None # Skip the calculation of text-to-image alignment at inference
+        target_classes_i = torch.as_tensor(target_classes_i).to(device)
+        return target_classes_i, target_classes_t
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
@@ -186,5 +195,14 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                aux_outputs.update({'logits_per_hoi': outputs['logits_per_hoi']})
+                indices = self.matcher(aux_outputs, targets)
+                for loss in ['boxes', 'confidences']:
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes)
+                    l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
 
         return losses, indices

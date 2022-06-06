@@ -1,4 +1,8 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Modified by Suchen for HOI detection
+"""
+Modules to compute the matching cost and solve the corresponding LSAP.
+"""
 """
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
@@ -36,7 +40,7 @@ class HungarianMatcher(nn.Module):
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
         self.cost_conf = cost_conf
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0 or cost_conf != 0, "all costs cant be 0"
 
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -44,8 +48,9 @@ class HungarianMatcher(nn.Module):
 
         Params:
             outputs: This is a dict that contains at least these entries:
-                 "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
+                 "logits_per_hoi": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
                  "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
+                 "box_scores": Tensor of dim [batch_size, num_queries, 1] with the predicted box confidence scores
 
             targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
                  "labels": Tensor of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
@@ -64,7 +69,7 @@ class HungarianMatcher(nn.Module):
         # We flatten to compute the cost matrices in a batch
         out_prob = outputs["logits_per_hoi"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 8]
-        out_conf = outputs["confidence_scores"].flatten(0, 1).sigmoid()
+        out_conf = outputs["box_scores"].flatten(0, 1).sigmoid() # [batch_size * num_queries, 1]
 
         # Also concat the target labels and boxes. During the training, due to the limit
         # GPU memory, we also consider the texts within each mini-batch. Differently, during
@@ -93,18 +98,20 @@ class HungarianMatcher(nn.Module):
         # but approximate it in 1 - proba[target class].
         # The 1 is a constant that doesn't change the matching, it can be ommitted.
         cost_class = -out_prob[:, tgt_ids]
-        
+
         # Compute the confidence cost
         cost_conf = -out_conf
 
         # Compute the L1 cost between boxes
+        if out_bbox.dtype == torch.float16:
+            out_bbox = out_bbox.type(torch.float32)
         cost_pbbox = torch.cdist(out_bbox[:, :4], tgt_bbox[:, :4], p=1)
         cost_obbox = torch.cdist(out_bbox[:, 4:], tgt_bbox[:, 4:], p=1)
-    
+
         # Compute the giou cost betwen boxes
         cost_pgiou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[:, :4]), box_cxcywh_to_xyxy(tgt_bbox[:, :4]))
         cost_ogiou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[:, 4:]), box_cxcywh_to_xyxy(tgt_bbox[:, 4:]))
-        
+
         # Final cost matrix
         C = self.cost_bbox * cost_pbbox + self.cost_bbox * cost_obbox + \
             self.cost_giou * cost_pgiou + self.cost_giou * cost_ogiou + \
@@ -121,5 +128,5 @@ def build_matcher(args):
         cost_class=args.set_cost_class,
         cost_bbox=args.set_cost_bbox,
         cost_giou=args.set_cost_giou,
-        cost_conf=2.
+        cost_conf=args.set_cost_conf,
     )
