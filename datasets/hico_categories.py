@@ -894,18 +894,3 @@ VERB_MAPPER = {
     'pack': 'packing', 'zip': 'zipping', 'flush': 'flushing', 'brush': 'brushing',
     'install': 'installing', 'lose': 'losing', 'toast': 'toasting'
 }
-
-
-object_to_related_hois = collections.defaultdict(list)
-action_to_related_hois = collections.defaultdict(list)
-
-for x in HICO_INTERACTIONS:
-    action_text = x['action']
-    object_text = x['object']
-    hoi_id = x['interaction_id']
-    if hoi_id in ZERO_SHOT_INTERACTION_IDS or hoi_id in NON_INTERACTION_IDS:
-        continue
-    hoi_text = [action_text, object_text]
-
-    object_to_related_hois[object_text].append({'hoi_id': hoi_id, 'text': hoi_text})
-    action_to_related_hois[action_text].append({'hoi_id': hoi_id, 'text': hoi_text})

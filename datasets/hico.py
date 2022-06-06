@@ -3,12 +3,13 @@ HICO-DET dataset utils
 """
 import os
 import json
+import collections
 import torch
 import torch.utils.data
 from torchvision.datasets import CocoDetection
 import datasets.transforms as T
 from PIL import Image
-from .hico_categories import HICO_INTERACTIONS, HICO_ACTIONS, HICO_OBJECTS, ZERO_SHOT_INTERACTION_IDS
+from .hico_categories import HICO_INTERACTIONS, HICO_ACTIONS, HICO_OBJECTS, ZERO_SHOT_INTERACTION_IDS, NON_INTERACTION_IDS
 from utils.sampler import repeat_factors_from_category_frequency, get_dataset_indices
 
 
@@ -46,12 +47,13 @@ class HICO(CocoDetection):
         """
         self.root = img_folder
         self.transforms = transforms
-        ''' deprecated, text
         # Text description of human-object interactions
         dataset_texts, text_mapper = prepare_dataset_text()
         self.dataset_texts = dataset_texts
-        self.text_mapper = text_mapper
-        '''
+        self.text_mapper = text_mapper # text to contiguous ids for evaluation
+        object_to_related_hois, action_to_related_hois = prepare_related_hois()
+        self.object_to_related_hois = object_to_related_hois
+        self.action_to_related_hois = action_to_related_hois
         # Load dataset
         repeat_factor_sampling = repeat_factor_sampling and image_set == "train"
         zero_shot_exp = zero_shot_exp and image_set == "train"
@@ -204,7 +206,7 @@ def load_hico_json(
 
     return dataset_dicts
 
-''' deprecated, text
+
 def prepare_dataset_text():
     texts = []
     text_mapper = {}
@@ -215,7 +217,43 @@ def prepare_dataset_text():
         text_mapper[len(texts)] = i
         texts.append(s)
     return texts, text_mapper
-'''
+
+
+def prepare_related_hois():
+    ''' Gather related hois based on object names and action names
+    Returns:
+        object_to_related_hois (dict): {
+            object_text (e.g., chair): [
+                {'hoi_id': 86, 'text': ['carry', 'chair']},
+                {'hoi_id': 87, 'text': ['hold', 'chair']},
+                ...
+            ]
+        }
+
+        action_to_relatedhois (dict): {
+            action_text (e.g., carry): [
+                {'hoi_id': 10, 'text': ['carry', 'bicycle']},
+                {'hoi_id': 46, 'text': ['carry', 'bottle']},
+                ...
+            ]
+        }
+    '''
+    object_to_related_hois = collections.defaultdict(list)
+    action_to_related_hois = collections.defaultdict(list)
+
+    for x in HICO_INTERACTIONS:
+        action_text = x['action']
+        object_text = x['object']
+        hoi_id = x['interaction_id']
+        if hoi_id in ZERO_SHOT_INTERACTION_IDS or hoi_id in NON_INTERACTION_IDS:
+            continue
+        hoi_text = [action_text, object_text]
+
+        object_to_related_hois[object_text].append({'hoi_id': hoi_id, 'text': hoi_text})
+        action_to_related_hois[action_text].append({'hoi_id': hoi_id, 'text': hoi_text})
+
+    return object_to_related_hois, action_to_related_hois
+
 
 def make_transforms(image_set, args):
     normalize = T.Compose([
@@ -232,7 +270,7 @@ def make_transforms(image_set, args):
             T.RandomSelect(
                 T.RandomResize(scales, max_size=scales[-1] * 1333 // 800),
                 T.Compose([
-                    T.RandomCrop_InteractionConstraint((0.8, 0.8), 0.8),
+                    T.RandomCrop_InteractionConstraint((0.75, 0.75), 0.8),
                     T.RandomResize(scales, max_size=scales[-1] * 1333 // 800),
                 ])
             ),

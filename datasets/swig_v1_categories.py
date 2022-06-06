@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 This file hard-codes metadata for SWiG v1.0 dataset. This will includes:
-    1. All SWiG categories with definition. 
+    1. All SWiG categories with definition.
         {
             "gloss": [str],
             "def": str,
