@@ -106,7 +106,7 @@ def evaluate(model, postprocessors, criterion, data_loader, device, args):
         if args.vis_outputs:
             visualizer = Visualizer(args)
             visualizer.visualize_preds(images, targets, outputs)
-            visualizer.visualize_attention(images, targets, outputs)
+            # visualizer.visualize_attention(images, targets, outputs)
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)

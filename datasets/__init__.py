@@ -15,9 +15,9 @@ def build_dataset(image_set, args):
 
 def build_evaluator(args):
     if args.dataset_file == "swig":
-        from .swig import SWIG_DEV_ANNO
-        evaluator = SWiGEvaluator(SWIG_DEV_ANNO, args.output_dir)
-    if args.dataset_file == "hico":
+        from .swig import SWIG_VAL_ANNO
+        evaluator = SWiGEvaluator(SWIG_VAL_ANNO, args.output_dir)
+    elif args.dataset_file == "hico":
         from .hico import HICO_VAL_ANNO
         evaluator = HICOEvaluator(HICO_VAL_ANNO, args.output_dir)
     else:

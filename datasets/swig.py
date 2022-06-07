@@ -12,10 +12,10 @@ from .swig_v1_categories import SWIG_INTERACTIONS, SWIG_ACTIONS, SWIG_CATEGORIES
 from utils.sampler import repeat_factors_from_category_frequency, get_dataset_indices
 
 # NOTE: Replace the path to your file
-SWIG_ROOT = "/raid1/suchen/dataset/swig/images_512"
-SWIG_TRAIN_ANNO = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_trainval_1000.json"
-SWIG_VAL_ANNO = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"
-SWIG_DEV_ANNO = "/raid1/suchen/repo/promting_hoi/data/swig_hoi/swig_dev_1000.json"
+SWIG_ROOT = "/mnt/data/suchen/dataset/swig/images_512"
+SWIG_TRAIN_ANNO = "./data/swig_hoi/swig_trainval_1000.json"
+SWIG_VAL_ANNO = "./data/swig_hoi/swig_test_1000.json"
+SWIG_TEST_ANNO = "./data/swig_hoi/swig_test_1000.json"
 
 
 class SWiGHOIDetection(CocoDetection):
@@ -209,7 +209,8 @@ def make_transforms(image_set, args):
         T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
     ])
 
-    scales = [224, 256, 288, 320, 352, 384, 416, 448, 480, 512]
+    # scales = [224, 256, 288, 320, 352, 384, 416, 448, 480, 512]
+    scales = [224, 256, 288, 320]
 
     if image_set == "train":
         return T.Compose([
@@ -270,7 +271,7 @@ def build(image_set, args):
     PATHS = {
         "train": (SWIG_ROOT, SWIG_TRAIN_ANNO),
         "val": (SWIG_ROOT, SWIG_VAL_ANNO),
-        "dev": (SWIG_ROOT, SWIG_DEV_ANNO),
+        "dev": (SWIG_ROOT, SWIG_TEST_ANNO),
     }
 
     img_folder, ann_file = PATHS[image_set]

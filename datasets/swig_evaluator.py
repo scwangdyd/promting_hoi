@@ -11,12 +11,12 @@ class SWiGEvaluator(object):
     def __init__(self, anno_file, output_dir):
         eval_hois = [x["id"] for x in SWIG_INTERACTIONS if x["evaluation"] == 1]
         size = max(eval_hois) + 1
+        self.eval_hois = eval_hois
 
         self.gts = self.load_anno(anno_file)
         self.scores = {i: [] for i in range(size)}
         self.boxes = {i: [] for i in range(size)}
         self.keys = {i: [] for i in range(size)}
-        self.eval_hois = eval_hois
         self.swig_ap  = np.zeros(size)
         self.swig_rec = np.zeros(size)
         self.output_dir = output_dir
@@ -57,8 +57,10 @@ class SWiGEvaluator(object):
         with open(os.path.join(self.output_dir, "preds.pkl"), "wb") as f:
             pickle.dump({"scores": self.scores, "boxes": self.boxes, "keys": self.keys}, f)
 
-    def save(self):
-        with open(os.path.join(self.output_dir, "dets.pkl"), "wb") as f:
+    def save(self, output_dir=None):
+        if output_dir is None:
+            output_dir = self.output_dir
+        with open(os.path.join(output_dir, "dets.pkl"), "wb") as f:
             pickle.dump({"gts": self.gts, "scores": self.scores, "boxes": self.boxes, "keys": self.keys}, f)
 
     def load_anno(self, anno_file):
