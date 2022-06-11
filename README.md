@@ -13,10 +13,10 @@ THID is an end-to-end transformer-based human-object interaction (HOI) detector.
 
 ### Installation
 
-Our code is built upon [CLIP](https://github.com/openai/CLIP). This repo require to [install PyTorch 1.7.1](https://pytorch.org/get-started/locally/) and torchvision, as well as small additional dependencies.
+Our code is built upon [CLIP](https://github.com/openai/CLIP). This repo requires to install [PyTorch](https://pytorch.org/get-started/locally/) and torchvision, as well as small additional dependencies.
 
 ```bash
-conda install --yes -c pytorch pytorch=1.7.1 torchvision cudatoolkit=11.0
+conda install pytorch torchvision cudatoolkit=11.3 -c pytorch
 pip install ftfy regex tqdm numpy Pillow matplotlib
 ```
 
@@ -26,7 +26,7 @@ The experiments are mainly conducted on **HICO-DET** and **SWIG-HOI** dataset. W
 
 #### HICO-DET
 
-HICO-DET dataset can be downloaded [here](https://drive.google.com/open?id=1QZcJmGVlF9f4h-XLWe9Gkmnmj2z1gSnk). After finishing downloading, unpack the tarball (`hico_20160224_det.tar.gz`) to the `data` directory. We use the annotation files provided by the PPDM authors. We re-organize the annotation with additional meta info, e.g., image width and height. The annotation files can be downloaded from [here](https://drive.google.com/open?id=1lqmevkw8fjDuTqsOOgzg07Kf6lXhK2rg). The downloaded annotation files have to be placed as follows.
+HICO-DET dataset can be downloaded [here](https://drive.google.com/open?id=1QZcJmGVlF9f4h-XLWe9Gkmnmj2z1gSnk). After finishing downloading, unpack the tarball (`hico_20160224_det.tar.gz`) to the `data` directory. We use the annotation files provided by the [PPDM](https://github.com/YueLiao/PPDM) authors. We re-organize the annotation files with additional meta info, e.g., image width and height. The annotation files can be downloaded from [here](https://drive.google.com/open?id=1lqmevkw8fjDuTqsOOgzg07Kf6lXhK2rg). The downloaded files have to be placed as follows. Otherwise, please replace the default path to your custom locations in [datasets/hico.py](./datasets/hico.py).
 
 ``` plain
  |─ data
@@ -42,7 +42,7 @@ HICO-DET dataset can be downloaded [here](https://drive.google.com/open?id=1QZcJ
 
 #### SWIG-DET
 
-SWIG-DET dataset can be downloaded [here](https://swig-data-weights.s3.us-east-2.amazonaws.com/images_512.zip). After finishing downloading, unpack the `images_512.zip` to the `data` directory. The annotation files can be downloaded from [here](https://drive.google.com/open?id=1GxNP99J0KP6Pwfekij_M1Z0moHziX8QN). The downloaded files to be placed as follows.
+SWIG-DET dataset can be downloaded [here](https://swig-data-weights.s3.us-east-2.amazonaws.com/images_512.zip). After finishing downloading, unpack the `images_512.zip` to the `data` directory. The annotation files can be downloaded from [here](https://drive.google.com/open?id=1GxNP99J0KP6Pwfekij_M1Z0moHziX8QN). The downloaded files to be placed as follows. Otherwise, please replace the default path to your custom locations in [datasets/swig.py](./datasets/swig.py).
 
 ``` plain
  |─ data
@@ -61,13 +61,27 @@ SWIG-DET dataset can be downloaded [here](https://swig-data-weights.s3.us-east-2
 Run this command to train the model in HICO-DET dataset
 
 ``` bash
-python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py --batch_size 8 --output_dir [path to save checkpoint] --epochs 100 --lr 1e-4 --min-lr 1e-7 --hoi_token_length 50 --dataset_file hico --enable_dec
+python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py \
+    --batch_size 8 \
+    --output_dir [path to save checkpoint] \
+    --epochs 100 \
+    --lr 1e-4 --min-lr 1e-7 \
+    --hoi_token_length 50 \
+    --enable_dec \
+    --dataset_file hico
 ```
 
 Run this command to train the model in SWIG-HOI dataset
 
 ``` bash
-python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py --batch_size 8 --output_dir [path to save checkpoint] --epochs 100 --lr 1e-4 --min-lr 1e-7 --hoi_token_length 50 --dataset_file swig --enable_dec
+python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py \
+    --batch_size 8 \
+    --output_dir [path to save checkpoint] \
+    --epochs 100 \
+    --lr 1e-4 --min-lr 1e-7 \
+    --hoi_token_length 50 \
+    --enable_dec \
+    --dataset_file swig
 ```
 
 ## Inference
@@ -75,23 +89,42 @@ python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py --batch_
 Run this command to evaluate the model on HICO-DET dataset
 
 ``` bash
-python main.py --eval --batch_size 1 --output_dir [path to save results] --hoi_token_length 50 --enable_dec --pretrained [path to the pretrained model] --eval_size 256 [or 224 448 ...] --test_score_thresh 1e-5 --dataset_file hico
+python main.py --eval \
+    --batch_size 1 \
+    --output_dir [path to save results] \
+    --hoi_token_length 50 \
+    --enable_dec \
+    --pretrained [path to the pretrained model] \
+    --eval_size 256 [or 224 448 ...] \
+    --test_score_thresh 1e-4 \
+    --dataset_file hico
 ```
 
-Run this command to evaluate the model on HICO-DET dataset
+Run this command to evaluate the model on SWIG-HOI dataset
 
 ``` bash
-python main.py --eval --batch_size 4 --output_dir [path to save results] --hoi_token_length 50 --enable_dec --pretrained [path to the pretrained model] --eval_size 256 [or 224 448 ...] --test_score_thresh 1e-5 --dataset_file swig
+python main.py --eval \
+    --batch_size 8 \
+    --output_dir [path to save results] \
+    --hoi_token_length 10 \
+    --enable_dec \
+    --pretrained [path to the pretrained model] \
+    --eval_size 256 [or 224 448 ...] \
+    --test_score_thresh 1e-4 \
+    --dataset_file swig
 ```
 
 ## Models
 
-| Model | dataset | HOI Tokens | AP seen | AP novel | Log | Checkpoint |
+| Model | dataset | HOI Tokens | AP seen | AP unseen | Log | Checkpoint |
 | :-----: | :-----: | :-----: | :-----: | :-----: | :-----: | :-----: |
-| `THID-HICO` | HICO-DET | 50 |  |  | [Log](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.txt) | [params](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.pth)|
-| `THID-HICO` | HICO-DET | 10 |  |  | [Log](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.txt) | [params](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.pth)|
-| `THID-SWIG` | SWIG-HOI | 50 |  |  | [Log](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.txt) | [params](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.pth)|
-| `THID-SWIG` | SWIG-HOI | 10 |  |  | [Log](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.txt) | [params](https://github.com/naver-ai/vidt/releases/download/v0.1-vidt/vidt_nano_150.pth)|
+| `THID-HICO` | HICO-DET | 50 | 25.30 | 17.57 | [Log](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_hico_token50_epoch100_log.txt) | [params](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_hico_token50_epoch100.pth)|
+| `THID-HICO` | HICO-DET | 10 | 23.72 | 16.45 | [Log](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_hico_token10_epoch100_log.txt) | [params](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_hico_token10_epoch100.pth)|
+
+| Model | dataset | HOI Tokens | AP non-rare | AP rare | AP unseen |  Log | Checkpoint |
+| :-----: | :-----: | :-----: | :-----: | :-----: | :-----: | :-----: | :-----: |
+| `THID-SWIG` | SWIG-HOI | 20 | 19.49 | 14.13 | 10.49 | [Log](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_swig_token20_epoch100_log.txt) | [params](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_swig_token20_epoch100.pth)|
+| `THID-SWIG` | SWIG-HOI | 10 | 18.30 | 13.99 | 11.14 | [Log](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_swig_token10_epoch50_log.txt) | [params](https://github.com/scwangdyd/promting_hoi/releases/download/v0.2/thid_swig_token10_epoch50.pth)|
 
 ## Citing
 
