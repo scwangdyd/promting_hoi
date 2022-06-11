@@ -14,10 +14,10 @@ from utils.sampler import repeat_factors_from_category_frequency, get_dataset_in
 
 
 # NOTE: Replace the path to your file
-HICO_TRAIN_ROOT = "/mnt/data/suchen/dataset/hico_20160224_det/images/train2015"
-HICO_TRAIN_ANNO = "/mnt/data/suchen/repo/promting_hoi/data/HICO-DET/trainval_hico_ann.json"
-HICO_VAL_ROOT = "/mnt/data/suchen/dataset/hico_20160224_det/images/test2015"
-HICO_VAL_ANNO = "/mnt/data/suchen/repo/promting_hoi/data/HICO-DET/test_hico_ann.json"
+HICO_TRAIN_ROOT = "./data/hico_20160224_det/images/train2015"
+HICO_TRAIN_ANNO = "./data/hico_20160224_det/annotations/trainval_hico_ann.json"
+HICO_VAL_ROOT = "./data/hico_20160224_det/images/test2015"
+HICO_VAL_ANNO = "./data/hico_20160224_det/annotations/test_hico_ann.json"
 
 
 class HICO(CocoDetection):

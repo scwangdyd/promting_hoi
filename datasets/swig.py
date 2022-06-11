@@ -12,10 +12,10 @@ from .swig_v1_categories import SWIG_INTERACTIONS, SWIG_ACTIONS, SWIG_CATEGORIES
 from utils.sampler import repeat_factors_from_category_frequency, get_dataset_indices
 
 # NOTE: Replace the path to your file
-SWIG_ROOT = "/mnt/data/suchen/dataset/swig/images_512"
-SWIG_TRAIN_ANNO = "./data/swig_hoi/swig_trainval_1000.json"
-SWIG_VAL_ANNO = "./data/swig_hoi/swig_test_1000.json"
-SWIG_TEST_ANNO = "./data/swig_hoi/swig_test_1000.json"
+SWIG_ROOT = "./data/swig_hoi/images_512"
+SWIG_TRAIN_ANNO = "./data/swig_hoi/annotations/swig_trainval_1000.json"
+SWIG_VAL_ANNO = "./data/swig_hoi/annotations/swig_test_1000.json"
+SWIG_TEST_ANNO = "./data/swig_hoi/annotations/swig_test_1000.json"
 
 
 class SWiGHOIDetection(CocoDetection):
